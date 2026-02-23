@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import websocket
 
 try:
@@ -50,21 +51,143 @@ def render_app_chrome() -> None:
         <style>
         [data-testid="stDeployButton"] { display: none !important; }
         [data-testid="stToolbar"] [aria-label="Deploy"] { display: none !important; }
-        div[data-testid="stDecoration"] { display: none !important; }
-        #sylee2412-watermark {
+        [data-testid="stToolbar"] button[title*="Deploy"] { display: none !important; }
+        [data-testid="stToolbar"] button[aria-label*="Deploy"] { display: none !important; }
+        [data-testid="stToolbar"] a[title*="Deploy"] { display: none !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        function hideDeployOnly() {
+          const nodes = doc.querySelectorAll("button, a, div[role='button'], span");
+          nodes.forEach((el) => {
+            const text = (el.innerText || el.textContent || "").trim();
+            const title = (el.getAttribute("title") || "").trim();
+            const aria = (el.getAttribute("aria-label") || "").trim();
+            const marker = (text + " " + title + " " + aria).toLowerCase();
+            if (marker === "deploy" || marker.endsWith(" deploy") || marker.startsWith("deploy ")) {
+              const inHeader = el.closest("header, [data-testid='stHeader'], [data-testid='stToolbar']");
+              if (inHeader) {
+                const target = el.closest("button, a, div[role='button']") || el;
+                target.style.display = "none";
+                target.style.visibility = "hidden";
+              }
+            }
+          });
+        }
+        hideDeployOnly();
+        setInterval(hideDeployOnly, 1200);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def render_scan_wait_percent(active: bool) -> None:
+    if not active:
+        components.html(
+            """
+            <script>
+            const doc = window.parent.document;
+            const el = doc.getElementById("scan-wait-percent");
+            if (el) el.remove();
+            if (window.parent.__scanWaitTimer) {
+              clearInterval(window.parent.__scanWaitTimer);
+              window.parent.__scanWaitTimer = null;
+            }
+            window.parent.__scanWaitStartedAt = null;
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+        return
+
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        if (!window.parent.__scanWaitStartedAt) {
+          window.parent.__scanWaitStartedAt = Date.now();
+        }
+
+        function ensurePercent() {
+          let el = doc.getElementById("scan-wait-percent");
+          if (!el) {
+            el = doc.createElement("div");
+            el.id = "scan-wait-percent";
+            el.style.position = "fixed";
+            el.style.zIndex = "100001";
+            el.style.fontSize = "12px";
+            el.style.fontWeight = "700";
+            el.style.color = "#cbd5e1";
+            el.style.letterSpacing = "0.02em";
+            el.style.userSelect = "none";
+            el.style.pointerEvents = "none";
+            el.style.fontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+            el.style.background = "rgba(15,23,42,0.72)";
+            el.style.border = "1px solid rgba(148,163,184,0.35)";
+            el.style.borderRadius = "8px";
+            el.style.padding = "2px 8px";
+            doc.body.appendChild(el);
+          }
+
+          const stopNode = Array.from(doc.querySelectorAll("button, a, div[role='button'], span"))
+            .find(n => ((n.innerText || n.textContent || "").trim().toLowerCase() === "stop"));
+          if (stopNode) {
+            const rect = stopNode.getBoundingClientRect();
+            el.style.top = Math.max(6, rect.top) + "px";
+            el.style.left = Math.max(6, rect.left - 78) + "px";
+            el.style.right = "auto";
+          } else {
+            el.style.top = "8px";
+            el.style.right = "170px";
+            el.style.left = "auto";
+          }
+
+          const elapsed = (Date.now() - window.parent.__scanWaitStartedAt) / 1000.0;
+          const pct = Math.min(99, Math.max(1, Math.floor(1 + elapsed * 4.8)));
+          el.textContent = pct + "%";
+        }
+
+        ensurePercent();
+        if (!window.parent.__scanWaitTimer) {
+          window.parent.__scanWaitTimer = setInterval(ensurePercent, 500);
+        }
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def render_fixed_watermark() -> None:
+    st.markdown(
+        """
+        <style>
+        #sylee2412-watermark-fixed {
             position: fixed;
             top: 8px;
-            left: 14px;
-            z-index: 99999;
+            left: 12px;
+            z-index: 100000;
             font-size: 11px;
-            color: #8a8f98;
-            letter-spacing: 0.04em;
+            color: #cbd5e1;
+            letter-spacing: 0.02em;
             user-select: none;
             pointer-events: none;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: rgba(15, 23, 42, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 6px;
+            padding: 2px 6px;
         }
         </style>
-        <div id="sylee2412-watermark">sylee2412</div>
+        <div id="sylee2412-watermark-fixed">© sylee2412</div>
         """,
         unsafe_allow_html=True,
     )
@@ -397,11 +520,16 @@ def _scan_should_refresh(interval_sec: int, force: bool) -> bool:
 
 def main() -> None:
     render_app_chrome()
+    render_fixed_watermark()
     st.title("SmartStock Realtime Scanner")
     st.caption("Engineering monitor tool. Not financial advice.")
     base_url = DEFAULT_API_URL
 
     with st.sidebar:
+        st.markdown(
+            "<div style='font-size:13px;font-weight:600;color:#334155;margin-bottom:8px;'>© sylee2412</div>",
+            unsafe_allow_html=True,
+        )
         st.markdown(f"API: `{base_url}`")
         send_alerts = st.checkbox("Send Telegram alerts on scan", value=False)
         full_universe_scan = st.checkbox("Full NASDAQ scan (slow)", value=False)
@@ -420,6 +548,7 @@ def main() -> None:
 
     should_refresh = _scan_should_refresh(scan_interval_sec, run_scan)
     if should_refresh:
+        render_scan_wait_percent(True)
         scan_mode = "FULL NASDAQ" if full_universe_scan else "PREFILTER"
         with st.spinner(f"Scanner running ({scan_mode})... collecting market data."):
             t0 = time.time()
@@ -433,7 +562,9 @@ def main() -> None:
                 force=True,
             )
             st.session_state["scan_last_elapsed_sec"] = round(time.time() - t0, 1)
+        render_scan_wait_percent(False)
     else:
+        render_scan_wait_percent(False)
         payload, scan_exc = _maybe_refresh_scan(
             base_url,
             send_alerts,
