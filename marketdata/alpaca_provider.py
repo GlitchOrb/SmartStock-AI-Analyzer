@@ -102,7 +102,14 @@ class AlpacaProvider(MarketDataProvider):
                 )
                 resp.raise_for_status()
                 payload = resp.json() or {}
-                snapshots = payload.get("snapshots", {})
+                if isinstance(payload, dict) and isinstance(payload.get("snapshots"), dict):
+                    snapshots = payload.get("snapshots", {})
+                else:
+                    # Current Alpaca snapshot response is often a flat symbol->snapshot dict.
+                    snapshots = {
+                        k: v for k, v in payload.items()
+                        if k in chunk and isinstance(v, dict)
+                    }
             except Exception:
                 continue
 
@@ -110,18 +117,31 @@ class AlpacaProvider(MarketDataProvider):
                 try:
                     last_trade = obj.get("latestTrade") or {}
                     minute_bar = obj.get("minuteBar") or {}
+                    daily_bar = obj.get("dailyBar") or {}
+                    prev_daily = obj.get("prevDailyBar") or {}
                     prev_minute = obj.get("prevMinuteBar") or {}
-                    price = float(last_trade.get("p", minute_bar.get("c", 0.0)))
-                    ts = _parse_ts(last_trade.get("t"))
+                    price = float(
+                        last_trade.get("p")
+                        or minute_bar.get("c")
+                        or daily_bar.get("c")
+                        or 0.0
+                    )
+                    ts = _parse_ts(last_trade.get("t") or minute_bar.get("t") or daily_bar.get("t"))
                     vwap = minute_bar.get("vw")
-                    prev_close = float(prev_minute.get("c", 0.0) or 0.0)
+                    prev_close = float(
+                        prev_minute.get("c")
+                        or prev_daily.get("c")
+                        or 0.0
+                    )
                     chg_1m = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+                    if price <= 0:
+                        continue
                     out[ticker] = Snapshot(
                         ticker=ticker,
                         price=price,
                         timestamp=ts,
                         session=_session_label(ts),
-                        volume=float(minute_bar.get("v", 0.0) or 0.0),
+                        volume=float(daily_bar.get("v", minute_bar.get("v", 0.0)) or 0.0),
                         bid=(obj.get("latestQuote") or {}).get("bp"),
                         ask=(obj.get("latestQuote") or {}).get("ap"),
                         change_1m_pct=float(chg_1m),
@@ -156,44 +176,71 @@ class AlpacaProvider(MarketDataProvider):
         alpaca_tf = tf_map.get(timeframe, "1Min")
         end = end or datetime.now(timezone.utc)
         if start is None:
-            start = end - pd.Timedelta(days=30)
+            if timeframe == "1d":
+                start = end - pd.Timedelta(days=220)
+            elif timeframe == "1h":
+                start = end - pd.Timedelta(days=120)
+            elif timeframe in {"1m", "5m", "15m"}:
+                minute_step = {"1m": 1, "5m": 5, "15m": 15}[timeframe]
+                lookback_days = max(3, int(((limit * minute_step) / 1440) + 2))
+                start = end - pd.Timedelta(days=lookback_days)
+            else:
+                start = end - pd.Timedelta(days=30)
 
         out: dict[str, pd.DataFrame] = {}
         for i in range(0, len(tickers), 80):
             chunk = tickers[i : i + 80]
+            # Multi-symbol endpoint limit is total bars, not per-symbol.
+            # Request a larger page and then trim each symbol to `limit`.
+            total_limit = min(10_000, max(limit * len(chunk), limit))
             params = {
                 "symbols": ",".join(chunk),
                 "timeframe": alpaca_tf,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
-                "limit": limit,
+                "limit": total_limit,
                 "feed": self.data_feed,
                 "adjustment": "raw",
             }
             if timeframe != "1d":
                 params["asof"] = datetime.now(timezone.utc).date().isoformat()
 
-            try:
-                resp = requests.get(
-                    f"{self.rest_base}/stocks/bars",
-                    params=params,
-                    headers=self._headers(),
-                    timeout=20,
-                )
-                resp.raise_for_status()
-                payload = resp.json() or {}
-                bars_map = payload.get("bars", {})
-            except Exception:
-                continue
+            merged: dict[str, list[dict[str, Any]]] = {}
+            page_token: str | None = None
+            while True:
+                request_params = dict(params)
+                if page_token:
+                    request_params["page_token"] = page_token
+                try:
+                    resp = requests.get(
+                        f"{self.rest_base}/stocks/bars",
+                        params=request_params,
+                        headers=self._headers(),
+                        timeout=20,
+                    )
+                    resp.raise_for_status()
+                    payload = resp.json() or {}
+                except Exception:
+                    break
 
-            for ticker, bars in bars_map.items():
+                bars_map = payload.get("bars", {})
+                for ticker, bars in bars_map.items():
+                    if not bars:
+                        continue
+                    merged.setdefault(ticker, []).extend(bars)
+
+                page_token = payload.get("next_page_token")
+                if not page_token:
+                    break
+
+            for ticker, bars in merged.items():
                 if not bars:
                     continue
                 try:
                     df = pd.DataFrame(bars)
                     df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "t": "Timestamp"})
                     df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
-                    df = df.set_index("Timestamp")[["Open", "High", "Low", "Close", "Volume"]].dropna(how="any")
+                    df = df.set_index("Timestamp")[["Open", "High", "Low", "Close", "Volume"]].dropna(how="any").tail(limit)
                     out[ticker] = df
                 except Exception:
                     continue

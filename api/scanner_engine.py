@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,6 +16,8 @@ import pandas as pd
 from alerts.telegram import TelegramAlertSender
 from agents.risk_agent import RiskAgent
 from agents.catalyst_agent import run_catalyst_agent_fast
+from api.cache_layer import CacheLayer
+from api.surge import SurgeInput, evaluate_surge
 from data.universe import UniversePreFilterConfig, build_prefiltered_universe
 from marketdata.provider_base import MarketDataProvider
 from schemas.enums import Signal
@@ -84,6 +89,30 @@ def _bb_squeeze_break(series: pd.Series, period: int = 20) -> tuple[bool, float]
     return bool(squeeze and expansion and breakout), float(recent.iloc[-1])
 
 
+def _compose_score(
+    *,
+    breakout_any: bool,
+    vwap_ok: bool,
+    rel_volume_spike: bool,
+    momentum_confirmed: bool,
+    ema_stack: bool,
+    volatility_expansion: bool,
+    catalyst_score: float = 0.0,
+) -> tuple[float, dict[str, float], list[str]]:
+    breakdown: dict[str, float] = {
+        "breakout": 25.0 if breakout_any else 0.0,
+        "vwap": 15.0 if vwap_ok else 0.0,
+        "rel_volume": 20.0 if rel_volume_spike else 0.0,
+        "momentum": 15.0 if momentum_confirmed else 0.0,
+        "ema_stack": 10.0 if ema_stack else 0.0,
+        "volatility_expansion": 10.0 if volatility_expansion else 0.0,
+        "catalyst": min(10.0, max(0.0, catalyst_score)),
+    }
+    score = min(100.0, float(sum(breakdown.values())))
+    positives = [k for k, v in breakdown.items() if v > 0]
+    return score, breakdown, positives
+
+
 def _session_from_ts(ts: datetime) -> str:
     est = ts.astimezone(US_EASTERN)
     minutes = est.hour * 60 + est.minute
@@ -123,6 +152,15 @@ class ScannerConfig:
     score_delta_alert: float = 20.0
     alert_history_path: str = "data/cache/realtime_score_history.json"
     catalyst_enabled: bool = False
+    fast_top_k: int = 120
+    deep_top_n: int = 40
+    yfinance_symbol_cap: int = 80
+    snapshot_cache_ttl_s: int = 20
+    bars_1m_cache_ttl_s: int = 90
+    bars_1d_cache_ttl_s: int = 3600
+    scan_result_cache_ttl_s: int = 30
+    alert_cooldown_minutes: int = 20
+    provider_call_timeout_s: int = 45
 
 
 class RealtimeScannerEngine:
@@ -138,9 +176,117 @@ class RealtimeScannerEngine:
         self.telegram = telegram_sender or TelegramAlertSender()
         self.config = config or ScannerConfig()
         self.risk_agent = RiskAgent()
+        self.cache_layer = CacheLayer.from_env()
         self.warnings: list[str] = []
         self.latest_scan_by_ticker: dict[str, dict[str, Any]] = {}
-        self.breakout_alert_sent: set[str] = set()
+        self._obj_cache: dict[str, tuple[float, Any]] = {}
+        self._alert_last_sent: dict[str, float] = {}
+        self.last_metrics: dict[str, Any] = {}
+
+    @staticmethod
+    def _hash_key(prefix: str, tickers: list[str], **kwargs: Any) -> str:
+        payload = {
+            "tickers": sorted(tickers),
+            "kwargs": kwargs,
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return f"{prefix}:{hashlib.sha1(encoded).hexdigest()[:16]}"
+
+    def _obj_cache_get(self, key: str) -> Any | None:
+        item = self._obj_cache.get(key)
+        if not item:
+            return None
+        expires_at, value = item
+        if expires_at <= time.time():
+            self._obj_cache.pop(key, None)
+            return None
+        return value
+
+    def _obj_cache_set(self, key: str, value: Any, ttl_s: int) -> None:
+        self._obj_cache[key] = (time.time() + max(1, ttl_s), value)
+
+    def _run_with_timeout(self, fn: Any, timeout_s: int, *args: Any, default: Any = None) -> Any:
+        pool = ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(fn, *args)
+        try:
+            return fut.result(timeout=timeout_s)
+        except FutureTimeoutError:
+            return default
+        except Exception:
+            return default
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _get_snapshot_cached(self, tickers: list[str]) -> dict[str, Any]:
+        if not tickers:
+            return {}
+        key = self._hash_key("snapshot", tickers, provider=self.provider.name)
+        cached = self._obj_cache_get(key)
+        if isinstance(cached, dict) and cached:
+            return cached
+        if self.provider.name == "yfinance":
+            timeout_s = min(self.config.provider_call_timeout_s, 8)
+        else:
+            timeout_s = max(
+                self.config.provider_call_timeout_s,
+                min(120, 10 + (len(tickers) // 120) * 4),
+            )
+        snapshots = self._run_with_timeout(
+            self.provider.get_snapshot,
+            timeout_s,
+            tickers,
+            default={},
+        )
+        if not snapshots:
+            self.warnings.append(f"snapshot call timeout ({timeout_s}s)")
+        else:
+            self._obj_cache_set(key, snapshots, self.config.snapshot_cache_ttl_s)
+        return snapshots
+
+    def _get_bars_cached(
+        self,
+        tickers: list[str],
+        timeframe: str,
+        limit: int,
+        extended_hours: bool,
+        ttl_s: int,
+    ) -> dict[str, pd.DataFrame]:
+        if not tickers:
+            return {}
+        key = self._hash_key(
+            "bars",
+            tickers,
+            provider=self.provider.name,
+            timeframe=timeframe,
+            limit=limit,
+            extended=extended_hours,
+        )
+        cached = self._obj_cache_get(key)
+        if isinstance(cached, dict) and cached:
+            return cached
+        if self.provider.name == "yfinance":
+            timeout_s = min(self.config.provider_call_timeout_s, 12)
+        else:
+            timeout_s = max(
+                self.config.provider_call_timeout_s,
+                min(120, 12 + (len(tickers) // 100) * 4),
+            )
+        bars = self._run_with_timeout(
+            self.provider.get_bars,
+            timeout_s,
+            tickers,
+            timeframe,
+            None,
+            None,
+            limit,
+            extended_hours,
+            default={},
+        )
+        if not bars:
+            self.warnings.append(f"{timeframe} bars call timeout ({timeout_s}s)")
+        else:
+            self._obj_cache_set(key, bars, ttl_s)
+        return bars
 
     def _load_history(self) -> dict[str, float]:
         p = Path(self.config.alert_history_path)
@@ -148,6 +294,8 @@ class RealtimeScannerEngine:
             return {}
         try:
             payload = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and "scores" in payload:
+                payload = payload["scores"]
             return {str(k): float(v) for k, v in payload.items()}
         except Exception:
             return {}
@@ -155,10 +303,37 @@ class RealtimeScannerEngine:
     def _save_history(self, scores: dict[str, float]) -> None:
         p = Path(self.config.alert_history_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(scores, indent=2), encoding="utf-8")
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "scores": scores,
+        }
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _prefilter_universe(self) -> tuple[list[str], dict[str, Any]]:
         universe = self.provider.get_universe(include_etf=self.config.include_etf)
+        source_universe_size = len(universe)
+        if self.provider.name == "yfinance":
+            if len(universe) > self.config.yfinance_symbol_cap:
+                universe = universe[: self.config.yfinance_symbol_cap]
+                self.warnings.append(
+                    f"yfinance delayed mode cap applied: {len(universe)} symbols "
+                    "(configure Alpaca for full realtime NASDAQ coverage)."
+                )
+            stats = {
+                "source_universe_size": source_universe_size,
+                "scanned_tickers": len(universe),
+                "eligible_history_count": len(universe),
+                "price_pass_count": len(universe),
+                "liquidity_pass_count": len(universe),
+                "liquidity_threshold": self.config.min_avg_daily_volume,
+                "min_dollar_volume_20d": self.config.min_avg_daily_dollar_volume,
+                "min_price": self.config.min_price,
+                "min_history_days": 30,
+                "target_range": f"0-{self.config.yfinance_symbol_cap}",
+                "from_cache": False,
+                "prefilter_method": "yfinance_capped_universe",
+            }
+            return universe, stats
         cfg = UniversePreFilterConfig(
             liquidity_threshold=self.config.min_avg_daily_volume,
             min_dollar_volume_20d=self.config.min_avg_daily_dollar_volume,
@@ -169,24 +344,16 @@ class RealtimeScannerEngine:
         )
         if self.provider.name == "alpaca" and bool(getattr(self.provider, "configured", False)):
             try:
-                bars_map = self.provider.get_bars(
-                    universe,
-                    timeframe="1d",
-                    limit=max(40, cfg.min_history_days + 10),
-                    extended_hours=False,
-                )
                 kept: list[tuple[str, float]] = []
-                eligible_history = 0
+                snapshots = self._get_snapshot_cached(universe)
+                eligible_history = len(snapshots)
                 price_pass_count = 0
-                for ticker, df in bars_map.items():
-                    if df is None or df.empty or len(df) < cfg.min_history_days:
-                        continue
-                    eligible_history += 1
-                    last_price = float(df["Close"].iloc[-1])
+                for ticker, snap in snapshots.items():
+                    last_price = float(getattr(snap, "price", 0.0) or 0.0)
                     if pd.isna(last_price) or last_price < cfg.min_price:
                         continue
                     price_pass_count += 1
-                    avg_vol_20 = float(df["Volume"].tail(20).mean())
+                    avg_vol_20 = float(getattr(snap, "volume", 0.0) or 0.0)
                     avg_dollar_vol_20 = avg_vol_20 * last_price
                     if pd.isna(avg_vol_20) or avg_vol_20 < cfg.liquidity_threshold:
                         continue
@@ -198,8 +365,8 @@ class RealtimeScannerEngine:
                     kept = kept[: cfg.target_max_size]
                 selected = [t for t, _ in kept]
                 stats = {
-                    "source_universe_size": len(universe),
-                    "scanned_tickers": len(bars_map),
+                    "source_universe_size": source_universe_size,
+                    "scanned_tickers": len(snapshots),
                     "eligible_history_count": eligible_history,
                     "price_pass_count": price_pass_count,
                     "liquidity_pass_count": len(selected),
@@ -209,7 +376,7 @@ class RealtimeScannerEngine:
                     "min_history_days": cfg.min_history_days,
                     "target_range": f"{cfg.target_min_size}-{cfg.target_max_size}",
                     "from_cache": False,
-                    "prefilter_method": "provider_daily_bars",
+                    "prefilter_method": "provider_snapshot_liquidity",
                 }
                 if selected:
                     return selected, stats
@@ -217,6 +384,7 @@ class RealtimeScannerEngine:
             except Exception as exc:
                 self.warnings.append(f"Provider prefilter failed; fallback to yfinance prefilter. {exc}")
         filtered, stats = build_prefiltered_universe(universe, cfg)
+        stats["source_universe_size"] = source_universe_size
         stats["prefilter_method"] = "yfinance_download"
         return filtered, stats
 
@@ -241,21 +409,32 @@ class RealtimeScannerEngine:
             t2 = plan.get("target2")
             if any(v is not None for v in [entry, stop, t1, t2]):
                 plan_text = (
-                    f"\n*Plan:* Entry {entry if entry is not None else '-'} / "
-                    f"Stop {stop if stop is not None else '-'} / "
-                    f"T1 {t1 if t1 is not None else '-'} / T2 {t2 if t2 is not None else '-'}"
+                    f"\nPlan: Entry `{entry if entry is not None else '-'}` / "
+                    f"Stop `{stop if stop is not None else '-'}` / "
+                    f"T1 `{t1 if t1 is not None else '-'}` / T2 `{t2 if t2 is not None else '-'}`"
                 )
 
         reasons = ", ".join(surge_reason) if surge_reason else "None"
+        delta = new_score - old_score
         return (
-            f"📈 *Momentum Alert — {ticker}* ({session})\n"
-            f"💲 *Price:* `{price:.2f}`\n"
-            f"🔺 *Score:* `{old_score:.1f} -> {new_score:.1f}`\n"
-            f"🚀 *SurgeReason:* {reasons}\n"
-            f"🎯 *Strategy:* {strategy_label}\n"
-            f"📊 *Signals:* {', '.join(key_signals[:6])}\n"
-            f"💡 *Rationale:* {rationale[:180]}{plan_text}"
+            f"📈 *Momentum Alert* `{ticker}` ({session})\n"
+            f"Price: `{price:.2f}`\n"
+            f"Score: `{old_score:.1f} -> {new_score:.1f}` (`{delta:+.1f}`)\n"
+            f"Strategy: *{strategy_label}*\n"
+            f"Signals: {', '.join(key_signals[:6]) if key_signals else 'none'}\n"
+            f"SurgeReason: {reasons}\n"
+            f"Rationale: {rationale[:180]}{plan_text}"
         )
+
+    def _cooldown_ok(self, ticker: str, reason: str) -> bool:
+        key = f"{ticker}:{reason}"
+        now = time.time()
+        cooldown_seconds = self.config.alert_cooldown_minutes * 60
+        last_sent = self._alert_last_sent.get(key, 0.0)
+        if (now - last_sent) < cooldown_seconds:
+            return False
+        self._alert_last_sent[key] = now
+        return True
 
     def _score_one(
         self,
@@ -263,6 +442,7 @@ class RealtimeScannerEngine:
         snapshot: Any,
         bars_1m: pd.DataFrame | None,
         bars_1d: pd.DataFrame | None,
+        enable_catalyst: bool = False,
     ) -> dict[str, Any] | None:
         if snapshot is None or bars_1m is None or bars_1m.empty or bars_1d is None or bars_1d.empty:
             return None
@@ -343,53 +523,63 @@ class RealtimeScannerEngine:
         bb_break, bb_width = _bb_squeeze_break(bars_5m["Close"] if len(bars_5m) >= 30 else df_today["Close"])
         volatility_expansion = bool(bb_break)
 
-        score = 0.0
-        key_signals: list[str] = []
-        if breakout_any:
-            score += 25
-            key_signals.append("Breakout")
-        if above_vwap or vwap_reclaim:
-            score += 15
-            key_signals.append("VWAP Reclaim/Above")
-        if rel_volume >= 2.0:
-            score += 20
-            key_signals.append("RelVol Spike")
-        if (rsi_1m >= 60 or rsi_5m >= 60) and macd_bull:
-            score += 15
-            key_signals.append("Momentum Confirmed")
-        if ema_stack:
-            score += 10
-            key_signals.append("EMA Stack")
-        if volatility_expansion:
-            score += 10
-            key_signals.append("BB Expansion")
-
         catalyst_score = 0.0
         catalyst_events = []
-        if self.config.catalyst_enabled:
-            catalyst_events = run_catalyst_agent_fast(ticker)
+        if enable_catalyst:
+            try:
+                catalyst_events = run_catalyst_agent_fast(ticker)
+            except Exception:
+                catalyst_events = []
             if catalyst_events:
                 catalyst_score = min(10.0, 5.0 + 2.0 * len(catalyst_events))
-                score += catalyst_score
-                key_signals.append("Catalyst")
 
-        score = min(100.0, score)
+        momentum_confirmed = bool((rsi_1m >= 60 or rsi_5m >= 60) and macd_bull)
+        score, score_breakdown, key_signals = _compose_score(
+            breakout_any=breakout_any,
+            vwap_ok=bool(above_vwap or vwap_reclaim),
+            rel_volume_spike=bool(rel_volume >= 2.0),
+            momentum_confirmed=momentum_confirmed,
+            ema_stack=ema_stack,
+            volatility_expansion=volatility_expansion,
+            catalyst_score=catalyst_score,
+        )
         momentum_category = (
             "Strong Breakout Candidate" if score >= 70 else
             "Moderate Momentum" if score >= 50 else
             "Weak / Neutral" if score >= 30 else
             "No Momentum / Bearish"
         )
-        strategy_label = "Swing-breakout" if break_20d else "Day-momentum"
+        strategy_label = "Swing-breakout" if (break_20d and ema_stack and adx >= 25) else ("Day-momentum" if (breakout_any and rel_volume >= 2 and macd_bull) else ("Hold / Watch" if score >= 50 else "Watch"))
 
-        surge_reasons: list[str] = []
-        if rel_volume >= 3.0 and chg_5m >= 2.0:
-            surge_reasons.append("RelVol>=3 & 5m>=2%")
-        if break_premarket and vwap_reclaim and rel_volume >= 2.0:
-            surge_reasons.append("PremarketHigh Break + VWAP reclaim + Volume spike")
-        if bb_break and breakout_any:
-            surge_reasons.append("BB squeeze break + breakout")
-        surge_flag = bool(surge_reasons)
+        reg_series = est_series[
+            (est_series.index.time >= datetime(2000, 1, 1, 9, 30).time())
+            & (est_series.index.time < datetime(2000, 1, 1, 16, 0).time())
+        ]
+        orb_window = reg_series[
+            (reg_series.index.time >= datetime(2000, 1, 1, 9, 30).time())
+            & (reg_series.index.time <= datetime(2000, 1, 1, 10, 0).time())
+        ]
+        orb_high = float(orb_window["High"].max()) if not orb_window.empty else day_high_prev
+        orb_breakout = bool(session == "REG" and price > orb_high and len(reg_series) >= 12)
+
+        surge_payload = evaluate_surge(
+            SurgeInput(
+                session=session,
+                trigger_time=ts.isoformat(),
+                rel_volume=rel_volume,
+                change_5m_pct=chg_5m,
+                above_vwap=above_vwap,
+                vwap_reclaim=vwap_reclaim,
+                break_premarket_high=break_premarket,
+                breakout_any=breakout_any,
+                bb_squeeze_break=bb_break,
+                bb_bandwidth_now=bb_width,
+                bb_bandwidth_prev=bb_width * 0.8,
+                orb_breakout=orb_breakout,
+            )
+        )
+        surge_reasons = surge_payload["surge_reasons"]
+        surge_flag = bool(surge_payload["surge_flag"])
 
         halt_risk_proxy = bool(rel_volume >= 5.0 and abs(chg_5m) >= 5.0 and pre_range_pct >= 4.0)
 
@@ -407,6 +597,8 @@ class RealtimeScannerEngine:
             "macd_bullish": macd_bull,
             "ema_stack": ema_stack,
             "bb_squeeze_break": bb_break,
+            "orb_breakout": orb_breakout,
+            "adx_strong": bool(adx >= 25),
             "halt_risk_proxy": halt_risk_proxy,
         }
         indicators = {
@@ -427,6 +619,7 @@ class RealtimeScannerEngine:
             "premarket_high": round(premkt_high, 4),
             "day_high_prev": round(day_high_prev, 4),
             "high_20d": round(high_20d, 4),
+            "orb_high": round(orb_high, 4),
         }
 
         return {
@@ -442,8 +635,13 @@ class RealtimeScannerEngine:
             "adx": round(adx, 2),
             "breakout_flag": breakout_any,
             "score": round(score, 1),
+            "composite_score": round(score, 1),
+            "score_breakdown": score_breakdown,
+            "key_positive_signals": key_signals,
             "surge_flag": surge_flag,
             "surge_reason": surge_reasons,
+            "surge_evidence": surge_payload.get("supporting_evidence", {}),
+            "trigger_bar_time": surge_payload.get("trigger_bar_time", ts.isoformat()),
             "strategy_label": strategy_label,
             "momentum_category": momentum_category,
             "indicators": indicators,
@@ -453,9 +651,31 @@ class RealtimeScannerEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def run_scan(self, send_alerts: bool = False, full_universe: bool = False) -> dict[str, Any]:
+    def run_scan(
+        self,
+        send_alerts: bool = False,
+        full_universe: bool = False,
+        fast_top_k: int | None = None,
+        deep_top_n: int | None = None,
+    ) -> dict[str, Any]:
         self.warnings = []
-        if full_universe:
+        t0 = time.perf_counter()
+        fast_top_k = max(20, int(fast_top_k or self.config.fast_top_k))
+        deep_top_n = max(10, int(deep_top_n or self.config.deep_top_n))
+        deep_top_n = min(deep_top_n, fast_top_k)
+
+        cache_key = (
+            f"scan:{self.provider.name}:{int(full_universe)}:{fast_top_k}:{deep_top_n}:"
+            f"{int(self.config.catalyst_enabled)}"
+        )
+        if not send_alerts:
+            cached = self.cache_layer.get(cache_key)
+            if isinstance(cached, dict):
+                cached.setdefault("stats", {})
+                cached["stats"]["result_cache_hit"] = True
+                return cached
+
+        if full_universe and self.provider.name == "alpaca" and bool(getattr(self.provider, "configured", False)):
             universe = self.provider.get_universe(include_etf=self.config.include_etf)
             prefilter_stats = {
                 "source_universe_size": len(universe),
@@ -470,45 +690,114 @@ class RealtimeScannerEngine:
                 "target_range": "FULL",
                 "from_cache": False,
                 "full_universe_mode": True,
+                "prefilter_method": "full_universe_mode",
             }
         else:
             universe, prefilter_stats = self._prefilter_universe()
             prefilter_stats["full_universe_mode"] = False
+
         if not universe:
             return {"results": [], "stats": prefilter_stats, "warnings": ["No tickers after prefilter."]}
 
-        snapshots = self.provider.get_snapshot(universe)
-        valid_tickers = [t for t in universe if t in snapshots]
-        bars_1m = self.provider.get_bars(valid_tickers, "1m", limit=800, extended_hours=True)
-        bars_1d = self.provider.get_bars(valid_tickers, "1d", limit=60, extended_hours=False)
+        t_stage_a = time.perf_counter()
+        snapshots = self._get_snapshot_cached(universe)
+        ranked_by_liquidity: list[tuple[str, float]] = []
+        for t in universe:
+            snap = snapshots.get(t)
+            if not snap:
+                continue
+            price = float(getattr(snap, "price", 0.0) or 0.0)
+            vol = float(getattr(snap, "volume", 0.0) or 0.0)
+            ranked_by_liquidity.append((t, price * vol))
+        ranked_by_liquidity.sort(key=lambda x: x[1], reverse=True)
+        stage_a_symbol_cap = max(120, fast_top_k * 3)
+        valid_tickers = [t for t, _ in ranked_by_liquidity[:stage_a_symbol_cap]]
+        bars_1m_fast = self._get_bars_cached(
+            valid_tickers,
+            timeframe="1m",
+            limit=160,
+            extended_hours=True,
+            ttl_s=self.config.bars_1m_cache_ttl_s,
+        )
+        bars_1d_fast = self._get_bars_cached(
+            valid_tickers,
+            timeframe="1d",
+            limit=45,
+            extended_hours=False,
+            ttl_s=self.config.bars_1d_cache_ttl_s,
+        )
 
-        results: list[dict[str, Any]] = []
+        fast_rows: list[dict[str, Any]] = []
         for ticker in valid_tickers:
-            row = self._score_one(ticker, snapshots.get(ticker), bars_1m.get(ticker), bars_1d.get(ticker))
+            row = self._score_one(
+                ticker,
+                snapshots.get(ticker),
+                bars_1m_fast.get(ticker),
+                bars_1d_fast.get(ticker),
+                enable_catalyst=False,
+            )
             if row:
-                results.append(row)
+                fast_rows.append(row)
+        fast_rows.sort(key=lambda x: x["score"], reverse=True)
+        fast_rows = fast_rows[:fast_top_k]
+        t_stage_a_done = time.perf_counter()
 
+        deep_tickers = [r["ticker"] for r in fast_rows[:deep_top_n]]
+        t_stage_b = time.perf_counter()
+        deep_rows_by_ticker: dict[str, dict[str, Any]] = {}
+        if deep_tickers:
+            bars_1m_deep = self._get_bars_cached(
+                deep_tickers,
+                timeframe="1m",
+                limit=420,
+                extended_hours=True,
+                ttl_s=self.config.bars_1m_cache_ttl_s,
+            )
+            bars_1d_deep = self._get_bars_cached(
+                deep_tickers,
+                timeframe="1d",
+                limit=120,
+                extended_hours=False,
+                ttl_s=self.config.bars_1d_cache_ttl_s,
+            )
+            for ticker in deep_tickers:
+                row = self._score_one(
+                    ticker,
+                    snapshots.get(ticker),
+                    bars_1m_deep.get(ticker),
+                    bars_1d_deep.get(ticker),
+                    enable_catalyst=self.config.catalyst_enabled,
+                )
+                if row:
+                    deep_rows_by_ticker[ticker] = row
+        t_stage_b_done = time.perf_counter()
+
+        results = [deep_rows_by_ticker.get(r["ticker"], r) for r in fast_rows]
         results.sort(key=lambda x: x["score"], reverse=True)
-        history = self._load_history()
-        new_scores: dict[str, float] = {}
 
+        history = self._load_history()
+        new_scores: dict[str, float] = dict(history)
         for row in results:
             ticker = row["ticker"]
             old_score = float(history.get(ticker, 0.0))
             new_score = float(row["score"])
             new_scores[ticker] = new_score
             delta = new_score - old_score
-            triggered = False
-            if old_score > 0 and delta >= self.config.score_delta_alert:
-                triggered = True
-            if old_score < self.config.breakout_threshold <= new_score:
-                triggered = True
+            crossed = old_score < self.config.breakout_threshold <= new_score
+            jumped = old_score > 0 and delta >= self.config.score_delta_alert
+            score_reasons = []
+            if jumped:
+                score_reasons.append("score_jump")
+            if crossed:
+                score_reasons.append("score_cross")
+            if row.get("surge_flag"):
+                score_reasons.append("surge")
 
             plan = self.plan_store.get(ticker)
             plan_dict = plan.__dict__ if plan else None
-
             alert_message = ""
-            if triggered:
+            trigger_ok = bool(score_reasons) and any(self._cooldown_ok(ticker, reason) for reason in score_reasons)
+            if trigger_ok:
                 alert_message = self._build_alert_message(
                     ticker=ticker,
                     session=row["session"],
@@ -525,10 +814,13 @@ class RealtimeScannerEngine:
                     self.telegram.send_markdown(alert_message)
 
             row["alert"] = {
-                "triggered": triggered,
+                "triggered": trigger_ok,
                 "old_score": round(old_score, 1),
                 "new_score": round(new_score, 1),
+                "score_change": round(delta, 1),
+                "key_signals_changed": [k for k, v in row.get("signals", {}).items() if v],
                 "message": alert_message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             row["telegram_message"] = alert_message
             row["composite_score"] = row["score"]
@@ -536,15 +828,27 @@ class RealtimeScannerEngine:
 
         self.latest_scan_by_ticker = {row["ticker"]: row for row in results}
         self._save_history(new_scores)
-        return {
-            "results": results,
-            "stats": {
-                **prefilter_stats,
-                "provider": self.provider.name,
-                "result_count": len(results),
-            },
-            "warnings": self.warnings,
+        stats = {
+            **prefilter_stats,
+            "provider": self.provider.name,
+            "result_count": len(results),
+            "stage_a_symbol_cap": stage_a_symbol_cap,
+            "stage_a_scored": len(valid_tickers),
+            "stage_a_count": len(fast_rows),
+            "stage_b_count": len(deep_rows_by_ticker),
+            "stage_a_seconds": round(t_stage_a_done - t_stage_a, 3),
+            "stage_b_seconds": round(t_stage_b_done - t_stage_b, 3),
+            "scan_seconds": round(time.perf_counter() - t0, 3),
+            "fast_top_k": fast_top_k,
+            "deep_top_n": deep_top_n,
+            "result_cache_hit": False,
+            "delayed_mode": self.provider.name == "yfinance",
         }
+        self.last_metrics = stats
+        payload = {"results": results, "stats": stats, "warnings": self.warnings}
+        if (not send_alerts) and results:
+            self.cache_layer.set(cache_key, payload, self.config.scan_result_cache_ttl_s)
+        return payload
 
     def check_realtime_breakout_alert(self, ticker: str, session: str, price: float, send: bool = False) -> dict[str, Any]:
         """
@@ -555,8 +859,6 @@ class RealtimeScannerEngine:
         row = self.latest_scan_by_ticker.get(ticker)
         if not row:
             return {"triggered": False, "message": ""}
-        if ticker in self.breakout_alert_sent:
-            return {"triggered": False, "message": ""}
 
         signals = row.get("signals", {})
         breakout_ok = bool(signals.get("break_premarket_high") or signals.get("break_20d_high"))
@@ -565,6 +867,8 @@ class RealtimeScannerEngine:
         if session != "REG":
             return {"triggered": False, "message": ""}
         if not (breakout_ok and vwap_ok and vol_ok):
+            return {"triggered": False, "message": ""}
+        if not self._cooldown_ok(ticker, "realtime_breakout"):
             return {"triggered": False, "message": ""}
 
         plan = self.plan_store.get(ticker)
@@ -581,19 +885,30 @@ class RealtimeScannerEngine:
             rationale=row.get("rationale", "Realtime breakout conditions met."),
             plan=plan_dict,
         )
-        self.breakout_alert_sent.add(ticker)
         if send:
             self.telegram.send_markdown(message)
         return {"triggered": True, "message": message}
 
     def get_ticker_snapshot(self, ticker: str, timeframe: str = "1m") -> dict[str, Any]:
         ticker = ticker.upper().strip()
-        snap = self.provider.get_snapshot([ticker]).get(ticker)
+        snap = self._get_snapshot_cached([ticker]).get(ticker)
         if not snap:
             return {"ticker": ticker, "error": "snapshot_not_available"}
 
-        bars = self.provider.get_bars([ticker], timeframe=timeframe, limit=600, extended_hours=True).get(ticker)
-        bars_daily = self.provider.get_bars([ticker], timeframe="1d", limit=80, extended_hours=False).get(ticker)
+        bars = self._get_bars_cached(
+            [ticker],
+            timeframe=timeframe,
+            limit=700 if timeframe in {"1m", "5m"} else 400,
+            extended_hours=True,
+            ttl_s=self.config.bars_1m_cache_ttl_s,
+        ).get(ticker)
+        bars_daily = self._get_bars_cached(
+            [ticker],
+            timeframe="1d",
+            limit=120,
+            extended_hours=False,
+            ttl_s=self.config.bars_1d_cache_ttl_s,
+        ).get(ticker)
         if bars is None or bars.empty or bars_daily is None or bars_daily.empty:
             return {"ticker": ticker, "error": "bars_not_available"}
 
@@ -655,7 +970,7 @@ class RealtimeScannerEngine:
                     "bb_upper": float(bb_up.loc[idx]) if pd.notna(bb_up.loc[idx]) else None,
                     "bb_lower": float(bb_low.loc[idx]) if pd.notna(bb_low.loc[idx]) else None,
                 }
-                for idx, row in bars.tail(300).iterrows()
+                for idx, row in bars.tail(420).iterrows()
             ],
             "indicators": {
                 "rsi_14": round(rsi_val, 2),
@@ -668,9 +983,21 @@ class RealtimeScannerEngine:
                 "ema200": round(float(ema200.iloc[-1]), 4),
             },
             "signals": latest_row.get("signals", {}),
+            "score_breakdown": latest_row.get("score_breakdown", {}),
+            "surge_reason": latest_row.get("surge_reason", []),
             "composite_score": latest_score,
             "strategy_label": latest_row.get("strategy_label", "Day-momentum"),
             "rationale": latest_row.get("rationale", ""),
             "plan": saved_plan_payload,
             "recommended_trade_plan": suggested_plan_payload,
         }
+
+    def get_metrics(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider.name,
+            "latest_scan_metrics": self.last_metrics,
+            "cache_entries": len(self._obj_cache),
+            "tracked_tickers": len(self.latest_scan_by_ticker),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+

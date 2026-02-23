@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections import deque
 import json
@@ -54,6 +54,13 @@ def api_get(base_url: str, path: str, params: dict[str, Any] | None = None, time
 def api_post(base_url: str, path: str, payload: dict[str, Any]) -> Any:
     url = f"{base_url.rstrip('/')}{path}"
     resp = requests.post(url, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_put(base_url: str, path: str, payload: Any) -> Any:
+    url = f"{base_url.rstrip('/')}{path}"
+    resp = requests.put(url, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -296,11 +303,30 @@ def _fetch_universe_candidates(base_url: str, query: str) -> list[str]:
         return []
 
 
+def _fetch_watchlist(base_url: str) -> list[str]:
+    try:
+        payload = api_get(base_url, "/watchlist")
+        tickers = payload.get("tickers", [])
+        return [str(t).upper() for t in tickers]
+    except Exception:
+        return []
+
+
+def _save_watchlist(base_url: str, tickers: list[str]) -> list[str]:
+    try:
+        payload = api_put(base_url, "/watchlist", tickers)
+        return [str(t).upper() for t in payload.get("tickers", [])]
+    except Exception:
+        return tickers
+
+
 def _maybe_refresh_scan(
     base_url: str,
     send_alerts: bool,
     interval_sec: int,
     full_universe_scan: bool,
+    fast_top_k: int,
+    deep_top_n: int,
     force: bool = False,
 ) -> tuple[dict[str, Any] | None, Exception | None]:
     now = time.time()
@@ -316,6 +342,8 @@ def _maybe_refresh_scan(
                 params={
                     "send_alerts": send_alerts,
                     "full_universe": full_universe_scan,
+                    "fast_top_k": fast_top_k,
+                    "deep_top_n": deep_top_n,
                 },
                 timeout=300,
             )
@@ -329,6 +357,18 @@ def _maybe_refresh_scan(
     return st.session_state.get("scan_payload"), None
 
 
+def _scan_should_refresh(interval_sec: int, force: bool) -> bool:
+    if force:
+        return True
+    has_payload = "scan_payload" in st.session_state
+    if not has_payload:
+        return True
+    if interval_sec <= 0:
+        return False
+    last_run = float(st.session_state.get("scan_last_run_ts", 0.0) or 0.0)
+    return (time.time() - last_run) >= interval_sec
+
+
 def main() -> None:
     st.title("SmartStock Realtime Scanner")
     st.caption("Engineering monitor tool. Not financial advice.")
@@ -338,6 +378,8 @@ def main() -> None:
         st.markdown(f"API: `{base_url}`")
         send_alerts = st.checkbox("Send Telegram alerts on scan", value=False)
         full_universe_scan = st.checkbox("Full NASDAQ scan (slow)", value=False)
+        fast_top_k = st.number_input("FAST top K", min_value=50, max_value=2000, value=120, step=10)
+        deep_top_n = st.number_input("DEEP top N", min_value=20, max_value=500, value=40, step=10)
         auto_scan_label = st.selectbox("Scanner auto refresh", list(SCAN_INTERVAL_MAP.keys()), index=1)
         detail_timeframe = st.selectbox("Detail timeframe", ["1m", "5m", "15m", "1h", "1d"], index=0)
         auto_refresh_detail = st.checkbox("Auto-refresh detail", value=True)
@@ -349,13 +391,32 @@ def main() -> None:
     elif scan_interval_sec > 0 and not HAS_ST_AUTOREFRESH:
         st.caption("Install streamlit-autorefresh for timed scanner refresh.")
 
-    payload, scan_exc = _maybe_refresh_scan(
-        base_url,
-        send_alerts,
-        scan_interval_sec,
-        full_universe_scan=full_universe_scan,
-        force=run_scan,
-    )
+    should_refresh = _scan_should_refresh(scan_interval_sec, run_scan)
+    if should_refresh:
+        scan_mode = "FULL NASDAQ" if full_universe_scan else "PREFILTER"
+        with st.spinner(f"Scanner running ({scan_mode})... collecting market data."):
+            t0 = time.time()
+            payload, scan_exc = _maybe_refresh_scan(
+                base_url,
+                send_alerts,
+                scan_interval_sec,
+                full_universe_scan=full_universe_scan,
+                fast_top_k=int(fast_top_k),
+                deep_top_n=int(deep_top_n),
+                force=True,
+            )
+            st.session_state["scan_last_elapsed_sec"] = round(time.time() - t0, 1)
+    else:
+        payload, scan_exc = _maybe_refresh_scan(
+            base_url,
+            send_alerts,
+            scan_interval_sec,
+            full_universe_scan=full_universe_scan,
+            fast_top_k=int(fast_top_k),
+            deep_top_n=int(deep_top_n),
+            force=False,
+        )
+
     if scan_exc:
         render_backend_unavailable(base_url, scan_exc)
         return
@@ -365,30 +426,36 @@ def main() -> None:
         return
 
     results = payload.get("results", [])
-    if not results:
-        st.warning("No scan results.")
-        return
-
     stats = payload.get("stats", {})
     st.success(
         f"Provider={stats.get('provider')} | "
+        f"DelayedMode={stats.get('delayed_mode')} | "
         f"Prefiltered={stats.get('liquidity_pass_count', 0)} | "
+        f"Method={stats.get('prefilter_method', '-')} | "
         f"Mode={'FULL' if stats.get('full_universe_mode') else 'PREFILTER'} | "
+        f"StageA={stats.get('stage_a_count', '-')} ({stats.get('stage_a_seconds', '-') }s) | "
+        f"StageB={stats.get('stage_b_count', '-')} ({stats.get('stage_b_seconds', '-') }s) | "
         f"Results={stats.get('result_count', len(results))} | "
-        f"LastScan={st.session_state.get('scan_last_run_label', '-') }"
+        f"LastScan={st.session_state.get('scan_last_run_label', '-') } | "
+        f"Elapsed={st.session_state.get('scan_last_elapsed_sec', '-') }s"
     )
     for w in payload.get("warnings", [])[:8]:
         st.warning(w)
+    if should_refresh and not scan_exc:
+        st.info("Scan completed. Table is updated below.")
 
-    render_top_cards(results)
-    st.divider()
+    if not results:
+        st.warning("No scan results. You can still search any NASDAQ ticker and open detail below.")
+    else:
+        render_top_cards(results)
+        st.divider()
 
     search_col, score_col, top_col = st.columns([2, 1, 1])
     search_text = search_col.text_input("Ticker search", value="", placeholder="AAPL / NVDA / TSLA ...")
     min_score = score_col.slider("Min score", min_value=0, max_value=100, value=0, step=5)
     top_only = top_col.checkbox("Top only (>=70)", value=False)
 
-    filtered = []
+    filtered: list[dict[str, Any]] = []
     for row in results:
         ticker = str(row.get("ticker", ""))
         score = float(row.get("score", 0.0) or 0.0)
@@ -400,18 +467,44 @@ def main() -> None:
             continue
         filtered.append(row)
 
-    if not filtered:
+    if results and not filtered:
         st.info("No rows matched filters. Showing full table.")
         filtered = results
 
-    table, clicked_ticker = render_scan_table(filtered)
+    table, clicked_ticker = render_scan_table(filtered) if filtered else (pd.DataFrame(), None)
 
     universe_matches = _fetch_universe_candidates(base_url, search_text)
-    detail_candidates = list(dict.fromkeys([*table["ticker"].tolist(), *universe_matches])) if not table.empty else universe_matches
+    server_watchlist = _fetch_watchlist(base_url)
+    detail_candidates = []
+    if not table.empty:
+        detail_candidates.extend(table["ticker"].tolist())
+    detail_candidates.extend(server_watchlist)
+    detail_candidates.extend(universe_matches)
     if not detail_candidates:
-        detail_candidates = [r["ticker"] for r in results]
+        detail_candidates.extend([r["ticker"] for r in results])
+    detail_candidates = list(dict.fromkeys([str(t).upper() for t in detail_candidates if t]))
+
+    with st.sidebar:
+        st.markdown("### Watchlist")
+        add_symbol = st.text_input("Add symbol", value="", placeholder="AAPL")
+        if st.button("Add to Watchlist", width="stretch") and add_symbol.strip():
+            updated = list(dict.fromkeys(server_watchlist + [add_symbol.strip().upper()]))
+            _save_watchlist(base_url, updated)
+            st.rerun()
+        current_watchlist = st.multiselect(
+            "Tracked symbols",
+            options=detail_candidates if detail_candidates else server_watchlist,
+            default=[s for s in server_watchlist if s in (detail_candidates if detail_candidates else server_watchlist)],
+            key="watchlist_symbols",
+        )
+        if st.button("Save Watchlist", width="stretch"):
+            _save_watchlist(base_url, current_watchlist)
+            st.success("Watchlist updated.")
 
     st.markdown("#### Detail")
+    if not detail_candidates:
+        st.info("Type a ticker in search to load details.")
+        return
     default_index = 0
     if clicked_ticker and clicked_ticker in detail_candidates:
         default_index = detail_candidates.index(clicked_ticker)
@@ -463,6 +556,18 @@ def main() -> None:
     st.write(f"Strategy: {strategy_label}")
     if rationale:
         st.caption(rationale)
+    score_breakdown = detail.get("score_breakdown", selected_row.get("score_breakdown", {}))
+    if score_breakdown:
+        st.markdown("#### Score Breakdown")
+        sb_df = pd.DataFrame(
+            [{"component": k, "points": v} for k, v in score_breakdown.items()]
+        ).sort_values("points", ascending=False)
+        st.dataframe(sb_df, width="stretch", hide_index=True)
+    surge_reasons = detail.get("surge_reason", selected_row.get("surge_reason", []))
+    if surge_reasons:
+        st.markdown("#### Surge Reasons")
+        for reason in surge_reasons:
+            st.caption(f"- {reason}")
 
     saved_plan = detail.get("plan", {})
     suggested = detail.get("recommended_trade_plan", {})

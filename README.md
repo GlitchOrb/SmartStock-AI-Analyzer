@@ -2,6 +2,7 @@
 
 Realtime NASDAQ momentum scanner with:
 - Full NASDAQ universe + prefilter pipeline
+- Two-stage scan (FAST -> DEEP) for speed
 - Provider abstraction (`alpaca` / `yfinance` fallback)
 - FastAPI realtime backend (`/scan`, `/ticker/{ticker}/snapshot`, `WS /stream`)
 - Streamlit interactive UI with chart overlays and user plan levels
@@ -15,9 +16,12 @@ Realtime NASDAQ momentum scanner with:
 - `marketdata/yfinance_provider.py` - delayed dev fallback provider
 - `data/universe.py` - NASDAQ universe + prefilter
 - `api/scanner_engine.py` - fast scan pipeline + scoring/surge logic + alert text
+- `api/surge.py` - surge condition engine and evidence payload
+- `api/cache_layer.py` - TTL cache layer (in-memory + optional Redis URL)
 - `api/server.py` - FastAPI service
 - `realtime/aggregator.py` - tick -> 1s/1m aggregation and tape buffers
 - `storage/plan_store.py` - SQLite user entry/stop/target persistence
+- `storage/watchlist_store.py` - SQLite watchlist persistence
 - `alerts/telegram.py` - Telegram Bot API sender
 - `ui/streamlit_app.py` - scanner + detail + chart + level editor UI
 
@@ -68,50 +72,28 @@ Expected when Alpaca is configured:
 - `"provider": "alpaca"`
 - `"provider_configured": true`
 
-## Docker / Cloud Run
-
-### Build images
-```bash
-docker build -f Dockerfile.api -t gcr.io/<PROJECT_ID>/smartstock-api:latest .
-docker build -f Dockerfile.ui -t gcr.io/<PROJECT_ID>/smartstock-ui:latest .
-```
-
-### Push images
-```bash
-docker push gcr.io/<PROJECT_ID>/smartstock-api:latest
-docker push gcr.io/<PROJECT_ID>/smartstock-ui:latest
-```
-
-### Deploy API (Cloud Run)
-```bash
-gcloud run deploy smartstock-api \
-  --image gcr.io/<PROJECT_ID>/smartstock-api:latest \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --set-env-vars MARKET_DATA_PROVIDER=alpaca,ALPACA_API_KEY=...,ALPACA_SECRET_KEY=...,ALPACA_DATA_FEED=iex,TELEGRAM_BOT_TOKEN=...,TELEGRAM_CHAT_ID=...
-```
-
-### Deploy UI (optional Cloud Run)
-```bash
-gcloud run deploy smartstock-ui \
-  --image gcr.io/<PROJECT_ID>/smartstock-ui:latest \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated
-```
-
-### Cloud Scheduler (periodic scan alerts)
-```bash
-gcloud scheduler jobs create http smartstock-scan-job \
-  --schedule="*/5 * * * 1-5" \
-  --uri="https://<API_URL>/scan?send_alerts=true" \
-  --http-method=GET
-```
-
 ## Notes
 
 - Alpaca is recommended for realtime + extended hours streaming.
-- yfinance mode is fallback and delayed.
+- yfinance mode is fallback and delayed, with an internal universe cap for stability.
 - UI includes one-line warning only and focuses on engineering workflow.
-- Scanner API supports full-universe mode: `GET /scan?full_universe=true` (slower).
+- Scanner API supports two-stage controls:
+  - `GET /scan?fast_top_k=120&deep_top_n=40`
+  - `GET /scan?full_universe=true` (Alpaca mode)
+- Watchlist API:
+  - `GET /watchlist`
+  - `PUT /watchlist`
+  - `POST /watchlist/{ticker}`
+  - `DELETE /watchlist/{ticker}`
+- Metrics API:
+  - `GET /metrics`
+
+## Troubleshooting
+
+- If UI says `No scan results`:
+  - check `GET /health` first
+  - verify `provider=alpaca` and `provider_configured=true` when using Alpaca
+  - if `provider=yfinance`, expect delayed data and capped scan size
+- If scan is slow:
+  - reduce `FAST top K` / `DEEP top N` in UI
+  - keep auto refresh interval at 3-5 minutes
