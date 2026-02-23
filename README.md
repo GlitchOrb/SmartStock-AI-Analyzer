@@ -32,6 +32,10 @@ Use `.env.example` as template.
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
+Compatibility aliases (also accepted):
+- `API_KEY` (same as `ALPACA_API_KEY`)
+- `API_SECRET_KEY` (same as `ALPACA_SECRET_KEY`)
+
 ## Windows Quick Start
 
 1. Create venv and install dependencies:
@@ -55,6 +59,14 @@ streamlit run ui/streamlit_app.py
 4. Open browser:
 - UI: `http://localhost:8501`
 - API docs: `http://localhost:8000/docs`
+
+5. Verify provider:
+```powershell
+python -c "import requests; print(requests.get('http://localhost:8000/health',timeout=10).json())"
+```
+Expected when Alpaca is configured:
+- `"provider": "alpaca"`
+- `"provider_configured": true`
 
 ## Docker / Cloud Run
 
@@ -102,4 +114,4 @@ gcloud scheduler jobs create http smartstock-scan-job \
 - Alpaca is recommended for realtime + extended hours streaming.
 - yfinance mode is fallback and delayed.
 - UI includes one-line warning only and focuses on engineering workflow.
-
+- Scanner API supports full-universe mode: `GET /scan?full_universe=true` (slower).
