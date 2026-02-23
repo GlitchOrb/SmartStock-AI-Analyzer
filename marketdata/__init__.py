@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except Exception:
+    pass
+
 from marketdata.alpaca_provider import AlpacaProvider
 from marketdata.polygon_provider import PolygonProvider
 from marketdata.provider_base import MarketDataProvider

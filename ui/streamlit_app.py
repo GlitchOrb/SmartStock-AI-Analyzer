@@ -44,9 +44,9 @@ _WS_STATE: dict[str, Any] = {
 }
 
 
-def api_get(base_url: str, path: str, params: dict[str, Any] | None = None) -> Any:
+def api_get(base_url: str, path: str, params: dict[str, Any] | None = None, timeout: int = 60) -> Any:
     url = f"{base_url.rstrip('/')}{path}"
-    resp = requests.get(url, params=params, timeout=60)
+    resp = requests.get(url, params=params, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -296,7 +296,13 @@ def _fetch_universe_candidates(base_url: str, query: str) -> list[str]:
         return []
 
 
-def _maybe_refresh_scan(base_url: str, send_alerts: bool, interval_sec: int, force: bool = False) -> tuple[dict[str, Any] | None, Exception | None]:
+def _maybe_refresh_scan(
+    base_url: str,
+    send_alerts: bool,
+    interval_sec: int,
+    full_universe_scan: bool,
+    force: bool = False,
+) -> tuple[dict[str, Any] | None, Exception | None]:
     now = time.time()
     last_run = float(st.session_state.get("scan_last_run_ts", 0.0) or 0.0)
     has_payload = "scan_payload" in st.session_state
@@ -304,7 +310,15 @@ def _maybe_refresh_scan(base_url: str, send_alerts: bool, interval_sec: int, for
 
     if force or (not has_payload) or due:
         try:
-            payload = api_get(base_url, "/scan", params={"send_alerts": send_alerts})
+            payload = api_get(
+                base_url,
+                "/scan",
+                params={
+                    "send_alerts": send_alerts,
+                    "full_universe": full_universe_scan,
+                },
+                timeout=300,
+            )
             st.session_state["scan_payload"] = payload
             st.session_state["scan_last_run_ts"] = now
             st.session_state["scan_last_run_label"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -323,6 +337,7 @@ def main() -> None:
     with st.sidebar:
         st.markdown(f"API: `{base_url}`")
         send_alerts = st.checkbox("Send Telegram alerts on scan", value=False)
+        full_universe_scan = st.checkbox("Full NASDAQ scan (slow)", value=False)
         auto_scan_label = st.selectbox("Scanner auto refresh", list(SCAN_INTERVAL_MAP.keys()), index=1)
         detail_timeframe = st.selectbox("Detail timeframe", ["1m", "5m", "15m", "1h", "1d"], index=0)
         auto_refresh_detail = st.checkbox("Auto-refresh detail", value=True)
@@ -334,7 +349,13 @@ def main() -> None:
     elif scan_interval_sec > 0 and not HAS_ST_AUTOREFRESH:
         st.caption("Install streamlit-autorefresh for timed scanner refresh.")
 
-    payload, scan_exc = _maybe_refresh_scan(base_url, send_alerts, scan_interval_sec, force=run_scan)
+    payload, scan_exc = _maybe_refresh_scan(
+        base_url,
+        send_alerts,
+        scan_interval_sec,
+        full_universe_scan=full_universe_scan,
+        force=run_scan,
+    )
     if scan_exc:
         render_backend_unavailable(base_url, scan_exc)
         return
@@ -352,6 +373,7 @@ def main() -> None:
     st.success(
         f"Provider={stats.get('provider')} | "
         f"Prefiltered={stats.get('liquidity_pass_count', 0)} | "
+        f"Mode={'FULL' if stats.get('full_universe_mode') else 'PREFILTER'} | "
         f"Results={stats.get('result_count', len(results))} | "
         f"LastScan={st.session_state.get('scan_last_run_label', '-') }"
     )

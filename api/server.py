@@ -33,9 +33,11 @@ aggregator = TickBarAggregator()
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    configured = bool(getattr(provider, "configured", True))
     return {
         "ok": True,
         "provider": provider.name,
+        "provider_configured": configured,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -57,9 +59,12 @@ def universe(
 
 
 @app.get("/scan")
-def scan(send_alerts: bool = Query(default=False)) -> dict[str, Any]:
+def scan(
+    send_alerts: bool = Query(default=False),
+    full_universe: bool = Query(default=False),
+) -> dict[str, Any]:
     try:
-        return scanner.run_scan(send_alerts=send_alerts)
+        return scanner.run_scan(send_alerts=send_alerts, full_universe=full_universe)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"scan_failed: {exc}")
 

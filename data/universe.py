@@ -16,7 +16,10 @@ import yfinance as yf
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-NASDAQ_LISTED_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+NASDAQ_LISTED_URLS = [
+    "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+    "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+]
 WIKI_NDX_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
 
 DEFAULT_FALLBACK = [
@@ -113,7 +116,19 @@ def _is_common_stock(row: pd.Series, include_etf: bool) -> bool:
 
 
 def _fetch_nasdaq_listed(include_etf: bool = False) -> list[str]:
-    response = _http_get_with_retry(NASDAQ_LISTED_URL, timeout=20, attempts=3)
+    response = None
+    last_exc: Exception | None = None
+    for url in NASDAQ_LISTED_URLS:
+        try:
+            response = _http_get_with_retry(url, timeout=20, attempts=3)
+            break
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if response is None:
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to load nasdaqlisted source.")
 
     lines = response.text.splitlines()
     body = [ln for ln in lines if "|" in ln and not ln.startswith("File Creation Time")]
@@ -151,7 +166,11 @@ def _fetch_nasdaq100_from_wikipedia() -> list[str]:
 def build_universe(cfg: UniverseConfig) -> list[str]:
     cached = _load_cache(_universe_cache_path(cfg), cfg.ttl_seconds)
     if cached and isinstance(cached.get("tickers"), list):
-        return list(cached["tickers"])
+        cached_tickers = list(cached["tickers"])
+        if cfg.kind == "nasdaq_all" and cfg.max_size == 0 and len(cached_tickers) < 500:
+            cached_tickers = []
+        if cached_tickers:
+            return cached_tickers
 
     tickers: list[str]
     try:
@@ -176,7 +195,8 @@ def build_universe(cfg: UniverseConfig) -> list[str]:
     if not tickers:
         tickers = DEFAULT_FALLBACK[:]
 
-    _save_cache(_universe_cache_path(cfg), {"tickers": tickers})
+    if not (cfg.kind == "nasdaq_all" and cfg.max_size == 0 and tickers == DEFAULT_FALLBACK):
+        _save_cache(_universe_cache_path(cfg), {"tickers": tickers})
     return tickers
 
 

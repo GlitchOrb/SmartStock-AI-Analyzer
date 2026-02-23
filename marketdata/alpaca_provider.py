@@ -50,8 +50,20 @@ class AlpacaProvider(MarketDataProvider):
     ) -> None:
         import os
 
-        self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
-        self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY", "")
+        self.api_key = (
+            api_key
+            or os.environ.get("ALPACA_API_KEY")
+            or os.environ.get("API_KEY")
+            or os.environ.get("APCA_API_KEY_ID")
+            or ""
+        )
+        self.secret_key = (
+            secret_key
+            or os.environ.get("ALPACA_SECRET_KEY")
+            or os.environ.get("API_SECRET_KEY")
+            or os.environ.get("APCA_API_SECRET_KEY")
+            or ""
+        )
         self.data_feed = (data_feed or os.environ.get("ALPACA_DATA_FEED", "iex")).lower()
         self.rest_base = "https://data.alpaca.markets/v2"
         self.ws_base = f"wss://stream.data.alpaca.markets/v2/{self.data_feed}"

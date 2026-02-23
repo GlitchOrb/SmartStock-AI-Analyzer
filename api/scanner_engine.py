@@ -167,7 +167,57 @@ class RealtimeScannerEngine:
             target_min_size=self.config.target_min_size,
             target_max_size=self.config.target_max_size,
         )
+        if self.provider.name == "alpaca" and bool(getattr(self.provider, "configured", False)):
+            try:
+                bars_map = self.provider.get_bars(
+                    universe,
+                    timeframe="1d",
+                    limit=max(40, cfg.min_history_days + 10),
+                    extended_hours=False,
+                )
+                kept: list[tuple[str, float]] = []
+                eligible_history = 0
+                price_pass_count = 0
+                for ticker, df in bars_map.items():
+                    if df is None or df.empty or len(df) < cfg.min_history_days:
+                        continue
+                    eligible_history += 1
+                    last_price = float(df["Close"].iloc[-1])
+                    if pd.isna(last_price) or last_price < cfg.min_price:
+                        continue
+                    price_pass_count += 1
+                    avg_vol_20 = float(df["Volume"].tail(20).mean())
+                    avg_dollar_vol_20 = avg_vol_20 * last_price
+                    if pd.isna(avg_vol_20) or avg_vol_20 < cfg.liquidity_threshold:
+                        continue
+                    if pd.isna(avg_dollar_vol_20) or avg_dollar_vol_20 < cfg.min_dollar_volume_20d:
+                        continue
+                    kept.append((ticker, avg_dollar_vol_20))
+                kept.sort(key=lambda item: item[1], reverse=True)
+                if cfg.target_max_size > 0:
+                    kept = kept[: cfg.target_max_size]
+                selected = [t for t, _ in kept]
+                stats = {
+                    "source_universe_size": len(universe),
+                    "scanned_tickers": len(bars_map),
+                    "eligible_history_count": eligible_history,
+                    "price_pass_count": price_pass_count,
+                    "liquidity_pass_count": len(selected),
+                    "liquidity_threshold": cfg.liquidity_threshold,
+                    "min_dollar_volume_20d": cfg.min_dollar_volume_20d,
+                    "min_price": cfg.min_price,
+                    "min_history_days": cfg.min_history_days,
+                    "target_range": f"{cfg.target_min_size}-{cfg.target_max_size}",
+                    "from_cache": False,
+                    "prefilter_method": "provider_daily_bars",
+                }
+                if selected:
+                    return selected, stats
+                self.warnings.append("Provider prefilter produced no tickers; falling back to yfinance prefilter.")
+            except Exception as exc:
+                self.warnings.append(f"Provider prefilter failed; fallback to yfinance prefilter. {exc}")
         filtered, stats = build_prefiltered_universe(universe, cfg)
+        stats["prefilter_method"] = "yfinance_download"
         return filtered, stats
 
     def _build_alert_message(
@@ -403,9 +453,27 @@ class RealtimeScannerEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def run_scan(self, send_alerts: bool = False) -> dict[str, Any]:
+    def run_scan(self, send_alerts: bool = False, full_universe: bool = False) -> dict[str, Any]:
         self.warnings = []
-        universe, prefilter_stats = self._prefilter_universe()
+        if full_universe:
+            universe = self.provider.get_universe(include_etf=self.config.include_etf)
+            prefilter_stats = {
+                "source_universe_size": len(universe),
+                "scanned_tickers": len(universe),
+                "eligible_history_count": len(universe),
+                "price_pass_count": len(universe),
+                "liquidity_pass_count": len(universe),
+                "liquidity_threshold": self.config.min_avg_daily_volume,
+                "min_dollar_volume_20d": self.config.min_avg_daily_dollar_volume,
+                "min_price": self.config.min_price,
+                "min_history_days": 30,
+                "target_range": "FULL",
+                "from_cache": False,
+                "full_universe_mode": True,
+            }
+        else:
+            universe, prefilter_stats = self._prefilter_universe()
+            prefilter_stats["full_universe_mode"] = False
         if not universe:
             return {"results": [], "stats": prefilter_stats, "warnings": ["No tickers after prefilter."]}
 
