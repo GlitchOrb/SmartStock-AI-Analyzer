@@ -44,6 +44,32 @@ _WS_STATE: dict[str, Any] = {
 }
 
 
+def render_app_chrome() -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stDeployButton"] { display: none !important; }
+        [data-testid="stToolbar"] [aria-label="Deploy"] { display: none !important; }
+        div[data-testid="stDecoration"] { display: none !important; }
+        #sylee2412-watermark {
+            position: fixed;
+            top: 8px;
+            left: 14px;
+            z-index: 99999;
+            font-size: 11px;
+            color: #8a8f98;
+            letter-spacing: 0.04em;
+            user-select: none;
+            pointer-events: none;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        </style>
+        <div id="sylee2412-watermark">sylee2412</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def api_get(base_url: str, path: str, params: dict[str, Any] | None = None, timeout: int = 60) -> Any:
     url = f"{base_url.rstrip('/')}{path}"
     resp = requests.get(url, params=params, timeout=timeout)
@@ -370,6 +396,7 @@ def _scan_should_refresh(interval_sec: int, force: bool) -> bool:
 
 
 def main() -> None:
+    render_app_chrome()
     st.title("SmartStock Realtime Scanner")
     st.caption("Engineering monitor tool. Not financial advice.")
     base_url = DEFAULT_API_URL
