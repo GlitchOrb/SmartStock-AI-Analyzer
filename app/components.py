@@ -1,4 +1,4 @@
-"""Reusable Streamlit UI components."""
+﻿"""Reusable Streamlit UI components."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def render_header(data: DataAgentOutput) -> None:
             f"""
             <h2 style="margin:0;">{data.company_name}</h2>
             <span style="color:#888; font-size:0.9rem;">
-                {data.ticker} · {data.sector.value} · {data.exchange}
+                {data.ticker} 쨌 {data.sector.value} 쨌 {data.exchange}
             </span>
             """,
             unsafe_allow_html=True,
@@ -177,7 +177,7 @@ def render_report_meta(report: ReportAgentOutput) -> None:
             data=report.pdf_bytes,
             file_name=f"{report.ticker}_{report.report_depth.value}_report.pdf",
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info("PDF is not available for this run.")
@@ -188,7 +188,7 @@ def render_report_meta(report: ReportAgentOutput) -> None:
             data=report.markdown_report.encode("utf-8"),
             file_name=f"{report.ticker}_{report.report_depth.value}_report.md",
             mime="text/markdown",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -202,3 +202,4 @@ def _confidence_to_percent(value: float | int | None) -> float:
     if conf <= 1.0:
         conf *= 100.0
     return max(0.0, min(100.0, conf))
+

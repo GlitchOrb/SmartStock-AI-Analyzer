@@ -11,9 +11,11 @@ import numpy as np
 import pandas as pd
 
 from alerts.telegram import TelegramAlertSender
+from agents.risk_agent import RiskAgent
 from agents.catalyst_agent import run_catalyst_agent_fast
 from data.universe import UniversePreFilterConfig, build_prefiltered_universe
 from marketdata.provider_base import MarketDataProvider
+from schemas.enums import Signal
 from storage.plan_store import PlanStore
 
 
@@ -135,6 +137,7 @@ class RealtimeScannerEngine:
         self.plan_store = plan_store
         self.telegram = telegram_sender or TelegramAlertSender()
         self.config = config or ScannerConfig()
+        self.risk_agent = RiskAgent()
         self.warnings: list[str] = []
         self.latest_scan_by_ticker: dict[str, dict[str, Any]] = {}
         self.breakout_alert_sent: set[str] = set()
@@ -540,7 +543,29 @@ class RealtimeScannerEngine:
         rsi_val = _rsi(close, 14)
         macd_line, macd_signal, macd_hist = _macd(close)
 
-        plan = self.plan_store.get(ticker)
+        latest_row = self.latest_scan_by_ticker.get(ticker, {})
+        latest_score = float(latest_row.get("score", 0.0) or 0.0)
+        if latest_score >= 70:
+            signal = Signal.STRONG_BUY
+        elif latest_score >= 50:
+            signal = Signal.BUY
+        else:
+            signal = Signal.HOLD
+
+        high_20d = float(bars_daily["High"].tail(20).max())
+        daily_ema20 = float(bars_daily["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        context = {
+            "breakout": bool(latest_row.get("breakout_flag", bool(snap.price > high_20d))),
+            "adx_strong": bool(float(latest_row.get("adx", 0.0) or 0.0) >= 25.0),
+            "ema20": float(latest_row.get("indicators", {}).get("ema20", daily_ema20)),
+            "resistance_20": float(latest_row.get("indicators", {}).get("high_20d", high_20d)),
+        }
+        suggested_plan = self.risk_agent.plan_from_df(bars_daily.tail(120), signal=signal, context=context)
+        suggested_plan_payload = suggested_plan.model_dump(mode="json") if suggested_plan else {}
+
+        saved_plan = self.plan_store.get(ticker)
+        saved_plan_payload = saved_plan.__dict__ if saved_plan else {}
+
         return {
             "ticker": ticker,
             "session": snap.session,
@@ -574,5 +599,10 @@ class RealtimeScannerEngine:
                 "ema50": round(float(ema50.iloc[-1]), 4),
                 "ema200": round(float(ema200.iloc[-1]), 4),
             },
-            "plan": plan.__dict__ if plan else {},
+            "signals": latest_row.get("signals", {}),
+            "composite_score": latest_score,
+            "strategy_label": latest_row.get("strategy_label", "Day-momentum"),
+            "rationale": latest_row.get("rationale", ""),
+            "plan": saved_plan_payload,
+            "recommended_trade_plan": suggested_plan_payload,
         }

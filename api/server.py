@@ -40,6 +40,22 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/universe")
+def universe(
+    q: str = Query(default="", max_length=20),
+    limit: int = Query(default=5000, ge=1, le=20000),
+    include_etf: bool = Query(default=False),
+) -> dict[str, Any]:
+    tickers = provider.get_universe(include_etf=include_etf)
+    query = q.strip().upper()
+    if query:
+        tickers = [t for t in tickers if query in t]
+    return {
+        "count": len(tickers),
+        "tickers": tickers[:limit],
+    }
+
+
 @app.get("/scan")
 def scan(send_alerts: bool = Query(default=False)) -> dict[str, Any]:
     try:
