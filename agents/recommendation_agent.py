@@ -13,7 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from schemas.agents import AnalysisAgentOutput, RecommendationAgentOutput
+from agents.base import BaseAgent
+from schemas.agents import (
+    AnalysisAgentOutput,
+    RecommendationAgentOutput,
+    DataAgentOutput,
+    SentimentAgentOutput,
+)
 from schemas.enums import ReportDepth
 from utils.gemini import gemini_client
 from utils.logger import log_agent
@@ -70,90 +76,109 @@ def _safe_default_recommendation(ticker: str) -> dict:
     }
 
 
-def run_recommendation_agent(
-    analysis: AnalysisAgentOutput,
-    depth: ReportDepth,
-) -> RecommendationAgentOutput:
+class RecommendationAgent(BaseAgent):
     """
-    Run the RecommendationAgent.
-    - Quick mode: SKIP (return empty output — handled by AnalysisAgent)
-    - Standard/Deep mode: 1 Gemini call
-    Returns RecommendationAgentOutput.
+    Produces Buy/Hold/Sell recommendation via Gemini.
+    Only called in Standard/Deep mode. Skipped in Quick mode (handled by AnalysisAgent).
     """
-    # Quick mode: skip, recommendation is already in AnalysisAgentOutput
-    if depth == ReportDepth.QUICK:
-        log_agent("RecommendationAgent", "Quick 모드 — 건너뜀 (AnalysisAgent에서 처리)")
+    name = "RecommendationAgent"
+
+    def run(
+        self,
+        data: DataAgentOutput,
+        analysis: AnalysisAgentOutput,
+        sentiment: SentimentAgentOutput | None = None,
+        depth: ReportDepth = ReportDepth.STANDARD,
+    ) -> RecommendationAgentOutput:
+        """
+        Run the RecommendationAgent.
+        - Quick mode: SKIP (return empty output — handled by AnalysisAgent)
+        - Standard/Deep mode: 1 Gemini call
+        """
+        # Quick mode: skip, recommendation is already in AnalysisAgentOutput
+        if depth == ReportDepth.QUICK:
+            log_agent(self.name, "Quick 모드 — 건너뜀 (AnalysisAgent에서 처리)")
+            return RecommendationAgentOutput(
+                ticker=analysis.ticker,
+                rating=analysis.rating or "Hold",
+                confidence=analysis.confidence,
+                rationale=analysis.rationale,
+                invalidation_triggers=analysis.invalidation_triggers,
+                risk_notes="",
+                generated_at=datetime.now(),
+            )
+
+        # Build context from analysis
+        user_prompt = (
+            f"종목: {analysis.ticker}\n\n"
+            f"=== 시나리오 분석 결과 ===\n\n"
+            f"강세 시나리오 (Bull Case):\n"
+            f"  논거: {analysis.bull_case.thesis}\n"
+            f"  촉매: {', '.join(analysis.bull_case.catalysts) if analysis.bull_case.catalysts else 'N/A'}\n"
+            f"  위험: {', '.join(analysis.bull_case.risks) if analysis.bull_case.risks else 'N/A'}\n\n"
+            f"기본 시나리오 (Base Case):\n"
+            f"  논거: {analysis.base_case.thesis}\n"
+            f"  동인: {', '.join(analysis.base_case.drivers) if analysis.base_case.drivers else 'N/A'}\n\n"
+            f"약세 시나리오 (Bear Case):\n"
+            f"  논거: {analysis.bear_case.thesis}\n"
+            f"  위험: {', '.join(analysis.bear_case.risks) if analysis.bear_case.risks else 'N/A'}\n"
+            f"  경고: {analysis.bear_case.warning}\n\n"
+            f"핵심 동인: {', '.join(analysis.key_drivers) if analysis.key_drivers else 'N/A'}\n\n"
+            f"위 분석을 기반으로 투자 추천을 생성하세요.\n"
+            f"Respond in Korean."
+        )
+
+        parsed: dict = {}
+
+        # Attempt #1
+        try:
+            log_agent(self.name, f"Gemini 호출 중 ({depth.value} 모드)...")
+            response = self.call_gemini(_SYSTEM_PROMPT, user_prompt, depth)
+            parsed = self.parse_json_response(response)
+        except Exception as e:
+            log_agent(self.name, f"[red]Gemini 호출 실패: {e}[/red]")
+
+        # If parsing failed, retry once with stricter prompt
+        if not parsed or "rating" not in parsed:
+            log_agent(self.name, "[yellow]JSON 파싱 실패 → 재시도 중...[/yellow]")
+            try:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"이전 응답의 JSON이 유효하지 않았습니다. "
+                    f"반드시 위 구조의 순수 JSON만 반환하세요.\n"
+                    f"Respond in Korean."
+                )
+                response2 = self.call_gemini(_RETRY_SYSTEM_PROMPT, retry_prompt, depth)
+                parsed = self.parse_json_response(response2)
+            except Exception as e2:
+                log_agent(self.name, f"[red]재시도 실패: {e2}[/red]")
+
+        # If still failed, use safe default
+        if not parsed or "rating" not in parsed:
+            log_agent(self.name, "[red]안전 기본값 사용[/red]")
+            parsed = _safe_default_recommendation(analysis.ticker)
+
+        # Validate rating
+        rating = parsed.get("rating", "Hold")
+        if rating not in ("Buy", "Hold", "Sell"):
+            rating = "Hold"
+
         return RecommendationAgentOutput(
             ticker=analysis.ticker,
-            rating=analysis.rating or "Hold",
-            confidence=analysis.confidence,
-            rationale=analysis.rationale,
-            invalidation_triggers=analysis.invalidation_triggers,
-            risk_notes="",
+            rating=rating,
+            confidence=parsed.get("confidence", 0),
+            rationale=parsed.get("rationale", []),
+            invalidation_triggers=parsed.get("invalidation_triggers", []),
+            risk_notes=parsed.get("risk_notes", ""),
             generated_at=datetime.now(),
         )
 
-    # Build context from analysis
-    user_prompt = (
-        f"종목: {analysis.ticker}\n\n"
-        f"=== 시나리오 분석 결과 ===\n\n"
-        f"강세 시나리오 (Bull Case):\n"
-        f"  논거: {analysis.bull_case.thesis}\n"
-        f"  촉매: {', '.join(analysis.bull_case.catalysts) if analysis.bull_case.catalysts else 'N/A'}\n"
-        f"  위험: {', '.join(analysis.bull_case.risks) if analysis.bull_case.risks else 'N/A'}\n\n"
-        f"기본 시나리오 (Base Case):\n"
-        f"  논거: {analysis.base_case.thesis}\n"
-        f"  동인: {', '.join(analysis.base_case.drivers) if analysis.base_case.drivers else 'N/A'}\n\n"
-        f"약세 시나리오 (Bear Case):\n"
-        f"  논거: {analysis.bear_case.thesis}\n"
-        f"  위험: {', '.join(analysis.bear_case.risks) if analysis.bear_case.risks else 'N/A'}\n"
-        f"  경고: {analysis.bear_case.warning}\n\n"
-        f"핵심 동인: {', '.join(analysis.key_drivers) if analysis.key_drivers else 'N/A'}\n\n"
-        f"위 분석을 기반으로 투자 추천을 생성하세요.\n"
-        f"Respond in Korean."
-    )
 
-    parsed: dict = {}
-
-    # Attempt #1
-    try:
-        log_agent("RecommendationAgent", f"Gemini 호출 중 ({depth.value} 모드)...")
-        response = gemini_client.invoke("RecommendationAgent", _SYSTEM_PROMPT, user_prompt, depth)
-        parsed = _safe_json_loads(response)
-    except Exception as e:
-        log_agent("RecommendationAgent", f"[red]Gemini 호출 실패: {e}[/red]")
-
-    # If parsing failed, retry once with stricter prompt
-    if not parsed or "rating" not in parsed:
-        log_agent("RecommendationAgent", "[yellow]JSON 파싱 실패 → 재시도 중...[/yellow]")
-        try:
-            retry_prompt = (
-                f"{user_prompt}\n\n"
-                f"이전 응답의 JSON이 유효하지 않았습니다. "
-                f"반드시 위 구조의 순수 JSON만 반환하세요.\n"
-                f"Respond in Korean."
-            )
-            response2 = gemini_client.invoke("RecommendationAgent", _RETRY_SYSTEM_PROMPT, retry_prompt, depth)
-            parsed = _safe_json_loads(response2)
-        except Exception as e2:
-            log_agent("RecommendationAgent", f"[red]재시도 실패: {e2}[/red]")
-
-    # If still failed, use safe default
-    if not parsed or "rating" not in parsed:
-        log_agent("RecommendationAgent", "[red]안전 기본값 사용[/red]")
-        parsed = _safe_default_recommendation(analysis.ticker)
-
-    # Validate rating
-    rating = parsed.get("rating", "Hold")
-    if rating not in ("Buy", "Hold", "Sell"):
-        rating = "Hold"
-
-    return RecommendationAgentOutput(
-        ticker=analysis.ticker,
-        rating=rating,
-        confidence=parsed.get("confidence", 0),
-        rationale=parsed.get("rationale", []),
-        invalidation_triggers=parsed.get("invalidation_triggers", []),
-        risk_notes=parsed.get("risk_notes", ""),
-        generated_at=datetime.now(),
-    )
+def run_recommendation_agent(
+    data: DataAgentOutput,
+    analysis: AnalysisAgentOutput,
+    sentiment: SentimentAgentOutput | None = None,
+    depth: ReportDepth = ReportDepth.STANDARD,
+) -> RecommendationAgentOutput:
+    """Helper for functional calls."""
+    return RecommendationAgent().run(data, analysis, sentiment, depth)

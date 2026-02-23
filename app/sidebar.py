@@ -37,6 +37,7 @@ def render_sidebar() -> tuple[str, ReportDepth, bool]:
             max_chars=10,
             placeholder="e.g. AAPL, MSFT, GOOGL",
             help="Enter a valid stock ticker symbol",
+            key="sidebar_ticker",
         ).upper().strip()
 
         st.markdown("")
@@ -52,6 +53,7 @@ def render_sidebar() -> tuple[str, ReportDepth, bool]:
             options=list(depth_options.keys()),
             index=1,
             help="Quick: fast overview · Standard: balanced · Deep: comprehensive",
+            key="sidebar_depth",
         )
         depth = depth_options[depth_label]
 
@@ -62,6 +64,7 @@ def render_sidebar() -> tuple[str, ReportDepth, bool]:
             "🚀 Analyze Stock",
             use_container_width=True,
             type="primary",
+            key="sidebar_analyze_btn",
         )
 
         # Info box

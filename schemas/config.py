@@ -17,8 +17,13 @@ class Settings(BaseSettings):
     model_name: str = Field(default="gemini-2.0-flash", alias="MODEL_NAME")
     cache_ttl: int = Field(default=3600, alias="CACHE_TTL")
     report_depth: ReportDepth = Field(default=ReportDepth.STANDARD, alias="REPORT_DEPTH")
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    market_data_provider: str = Field(default="alpaca", alias="MARKET_DATA_PROVIDER")
+    alpaca_api_key: str = Field(default="", alias="ALPACA_API_KEY")
+    alpaca_secret_key: str = Field(default="", alias="ALPACA_SECRET_KEY")
+    alpaca_data_feed: str = Field(default="iex", alias="ALPACA_DATA_FEED")
 
-    # Derived paths
     project_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent)
 
     @property
@@ -49,6 +54,4 @@ class Settings(BaseSettings):
         "extra": "ignore",
     }
 
-
-# Singleton
 settings = Settings()

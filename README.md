@@ -1,107 +1,105 @@
 # SmartStock AI Analyzer
 
-> Stock analysis system with a 6-agent pipeline, RAG-based news retrieval, and PDF report generation.
+Realtime NASDAQ momentum scanner with:
+- Full NASDAQ universe + prefilter pipeline
+- Provider abstraction (`alpaca` / `yfinance` fallback)
+- FastAPI realtime backend (`/scan`, `/ticker/{ticker}/snapshot`, `WS /stream`)
+- Streamlit interactive UI with chart overlays and user plan levels
+- Telegram alerts for score surge / threshold crossing / breakout surge
 
-Fetches market data via yfinance, runs sentiment analysis on Google News using FAISS + Gemini, and outputs a buy/hold/sell recommendation as a Korean PDF report. Everything runs on free-tier tools.
+## Architecture
 
-## Install
+### Core modules
+- `marketdata/provider_base.py` - provider interface
+- `marketdata/alpaca_provider.py` - realtime + extended-hours capable provider
+- `marketdata/yfinance_provider.py` - delayed dev fallback provider
+- `data/universe.py` - NASDAQ universe + prefilter
+- `api/scanner_engine.py` - fast scan pipeline + scoring/surge logic + alert text
+- `api/server.py` - FastAPI service
+- `realtime/aggregator.py` - tick -> 1s/1m aggregation and tape buffers
+- `storage/plan_store.py` - SQLite user entry/stop/target persistence
+- `alerts/telegram.py` - Telegram Bot API sender
+- `ui/streamlit_app.py` - scanner + detail + chart + level editor UI
 
-```
+## Environment Variables
+
+Use `.env.example` as template.
+
+- `MARKET_DATA_PROVIDER=alpaca|yfinance`
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+- `ALPACA_DATA_FEED=iex|sip`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+## Windows Quick Start
+
+1. Create venv and install dependencies:
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -U pip
 pip install -r requirements.txt
 ```
 
-Create `.env` with your [Gemini API key](https://aistudio.google.com/apikey):
-
-```
-GEMINI_API_KEY=your_key_here
-```
-
-Optional env vars: `MODEL_NAME` (default: `gemini-2.0-flash`), `CACHE_TTL` (default: `3600`), `REPORT_DEPTH` (default: `standard`).
-
-For Korean PDF output, place [NanumGothic.ttf](https://fonts.google.com/specimen/Nanum+Gothic) in `assets/fonts/`.
-
-## Usage
-
-```
-streamlit run app.py
+2. Start backend API:
+```powershell
+uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-## How it works
-
-6 agents run sequentially:
-
-```
-DataAgent        - fetches OHLCV + fundamentals, computes 12 technical indicators
-ResearchAgent    - fetches Google News RSS, builds FAISS index, retrieves top-5 chunks
-SentimentAgent   - sentiment score [-1, +1], pros/cons, 2-5 source citations
-AnalysisAgent    - merges quant + qual data into bull/base/bear scenarios
-RecommendAgent   - buy/hold/sell + confidence % + invalidation triggers
-ReportAgent      - PDF with charts and citations (falls back to .md)
+3. Start Streamlit UI:
+```powershell
+streamlit run ui/streamlit_app.py
 ```
 
-3 depth modes: quick (2 LLM calls), standard (4), deep (6).
+4. Open browser:
+- UI: `http://localhost:8501`
+- API docs: `http://localhost:8000/docs`
 
-### RAG pipeline
+## Docker / Cloud Run
 
-```
-Google News RSS -> feedparser -> difflib dedup (80%) -> LangChain Documents
-  -> HuggingFace embeddings (all-MiniLM-L6-v2)
-  -> FAISS vector store (disk-cached)
-  -> top-5 similarity search
-  -> Gemini structured JSON output
-```
-
-### Technical indicators
-
-- Momentum: RSI(14)
-- Trend: MACD(12,26,9), MA-20, MA-60
-- Volatility: Bollinger Bands(20,2), annualized volatility
-- Risk: MDD, relative volume
-- Fundamentals: PER, PBR, ROE, EPS, debt ratio, market cap, beta, dividend yield
-
-## Project structure
-
-```
-app.py                          - streamlit entry point
-agents/
-  research_agent.py             - RAG news research
-  sentiment_agent.py            - sentiment scoring + citations
-  analysis_agent.py             - bull/base/bear scenarios
-  recommendation_agent.py       - buy/hold/sell rating
-rag/
-  loader.py                     - Google News RSS fetcher + dedup
-  vectorstore.py                - FAISS index + embeddings
-data/
-  fetcher.py                    - yfinance data + technicals
-reporting/
-  pdf_generator.py              - ReportLab PDF + matplotlib charts
-schemas/
-  agents.py                     - pydantic v2 I/O models
-  config.py                     - settings loader
-  enums.py                      - Signal, Sector, Depth enums
-utils/
-  gemini.py                     - gemini client (rate-limited)
-  logger.py                     - structured logger
-  cache.py                      - TTL file cache
-assets/fonts/
-  NanumGothic.ttf               - Korean font for PDF
+### Build images
+```bash
+docker build -f Dockerfile.api -t gcr.io/<PROJECT_ID>/smartstock-api:latest .
+docker build -f Dockerfile.ui -t gcr.io/<PROJECT_ID>/smartstock-ui:latest .
 ```
 
-## Tech stack
+### Push images
+```bash
+docker push gcr.io/<PROJECT_ID>/smartstock-api:latest
+docker push gcr.io/<PROJECT_ID>/smartstock-ui:latest
+```
 
-- **LLM** - Google Gemini 2.0 Flash
-- **RAG** - FAISS + all-MiniLM-L6-v2
-- **Data** - yfinance
-- **News** - Google News RSS + feedparser
-- **Frontend** - Streamlit
-- **PDF** - ReportLab + Matplotlib
-- **Schemas** - Pydantic v2
-- **Orchestration** - LangChain
+### Deploy API (Cloud Run)
+```bash
+gcloud run deploy smartstock-api \
+  --image gcr.io/<PROJECT_ID>/smartstock-api:latest \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars MARKET_DATA_PROVIDER=alpaca,ALPACA_API_KEY=...,ALPACA_SECRET_KEY=...,ALPACA_DATA_FEED=iex,TELEGRAM_BOT_TOKEN=...,TELEGRAM_CHAT_ID=...
+```
 
-## Disclaimer
+### Deploy UI (optional Cloud Run)
+```bash
+gcloud run deploy smartstock-ui \
+  --image gcr.io/<PROJECT_ID>/smartstock-ui:latest \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated
+```
 
-For educational and research purposes only. Not financial advice.
+### Cloud Scheduler (periodic scan alerts)
+```bash
+gcloud scheduler jobs create http smartstock-scan-job \
+  --schedule="*/5 * * * 1-5" \
+  --uri="https://<API_URL>/scan?send_alerts=true" \
+  --http-method=GET
+```
 
-## License
+## Notes
 
-[MIT](LICENSE)
+- Alpaca is recommended for realtime + extended hours streaming.
+- yfinance mode is fallback and delayed.
+- UI includes one-line warning only and focuses on engineering workflow.
+

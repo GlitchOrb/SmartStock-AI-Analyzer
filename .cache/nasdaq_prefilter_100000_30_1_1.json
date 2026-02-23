@@ -1,0 +1,16 @@
+{
+  "tickers": [
+    "AAPL"
+  ],
+  "stats": {
+    "source_universe_size": 1,
+    "scanned_tickers": 1,
+    "eligible_history_count": 1,
+    "liquidity_pass_count": 1,
+    "liquidity_threshold": 100000,
+    "min_history_days": 30,
+    "target_range": "1-1",
+    "from_cache": false
+  },
+  "saved_at": 1771827008.1514215
+}

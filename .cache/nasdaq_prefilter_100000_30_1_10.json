@@ -1,0 +1,18 @@
+{
+  "tickers": [
+    "NVDA",
+    "AAPL",
+    "MSFT"
+  ],
+  "stats": {
+    "source_universe_size": 3,
+    "scanned_tickers": 3,
+    "eligible_history_count": 3,
+    "liquidity_pass_count": 3,
+    "liquidity_threshold": 100000,
+    "min_history_days": 30,
+    "target_range": "1-10",
+    "from_cache": false
+  },
+  "saved_at": 1771826004.2146533
+}

@@ -1,0 +1,35 @@
+{
+  "tickers": [
+    "NVDA",
+    "INTC",
+    "AMZN",
+    "TSLA",
+    "PLTR",
+    "AAPL",
+    "MSFT",
+    "NFLX",
+    "GOOGL",
+    "AMD",
+    "MU",
+    "SMCI",
+    "MSTR",
+    "AVGO",
+    "META",
+    "COIN",
+    "QCOM",
+    "ARM",
+    "NET",
+    "CRWD"
+  ],
+  "stats": {
+    "source_universe_size": 20,
+    "scanned_tickers": 20,
+    "eligible_history_count": 20,
+    "liquidity_pass_count": 20,
+    "liquidity_threshold": 100000,
+    "min_history_days": 30,
+    "target_range": "500-1200",
+    "from_cache": false
+  },
+  "saved_at": 1771827468.8696315
+}

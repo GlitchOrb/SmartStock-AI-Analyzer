@@ -1,6 +1,3 @@
-"""
-SmartStock AI Analyzer — Streamlit Main Page
-"""
 
 from __future__ import annotations
 
@@ -96,8 +93,7 @@ from app.components import (
 )
 
 
-def main():
-    ticker, depth, run_clicked = render_sidebar()
+def main(ticker, depth, run_clicked):
 
     # Hero area
     if "report" not in st.session_state:
@@ -191,6 +187,7 @@ if st.session_state.get("run_triggered"):
                 try:
                     from agents.report_agent import ReportAgent
                     from agents.data_agent import DataAgent
+                    from agents.research_agent import ResearchAgent
                     from agents.sentiment_agent import SentimentAgent
                     from agents.analysis_agent import AnalysisAgent
                     from agents.recommendation_agent import RecommendationAgent
@@ -199,11 +196,10 @@ if st.session_state.get("run_triggered"):
                     report_agent = ReportAgent()
                     report = report_agent.run(ticker, depth)
 
-                    # We need individual outputs for the UI, so we re-run data agent
-                    # (cached, so instant) and extract from the report
+                    # We need individual outputs for the UI
                     data = DataAgent().run(ticker)
-
-                    sentiment = SentimentAgent().run(data, depth)
+                    research = ResearchAgent().run(data, depth)
+                    sentiment = SentimentAgent().run(data, research, depth)
                     analysis = AnalysisAgent().run(data, sentiment, depth)
                     recommendation = RecommendationAgent().run(data, analysis, sentiment, depth)
 
@@ -220,4 +216,4 @@ if st.session_state.get("run_triggered"):
                     st.error(f"❌ Analysis failed: {e}")
                     st.exception(e)
 else:
-    main()
+    main(ticker, depth, run_clicked)

@@ -13,7 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from schemas.agents import Citation, ResearchAgentOutput, SentimentAgentOutput
+from agents.base import BaseAgent
+from schemas.agents import Citation, ResearchAgentOutput, SentimentAgentOutput, DataAgentOutput
 from schemas.enums import ReportDepth
 from utils.gemini import gemini_client
 from utils.logger import log_agent
@@ -66,156 +67,171 @@ _RETRY_SYSTEM_PROMPT = """\
 Respond in Korean."""
 
 
-def run_sentiment_agent(
-    research: ResearchAgentOutput,
-    depth: ReportDepth,
-) -> SentimentAgentOutput:
+class SentimentAgent(BaseAgent):
     """
-    Run the SentimentAgent.
-    - Quick mode: SKIP → default neutral sentiment
-    - Standard/Deep mode: 1 Gemini call with retrieved chunks
-
-    If news count < 3: force neutral, add warning to cons[].
-    Returns SentimentAgentOutput.
+    Uses retrieved news chunks + Gemini to produce sentiment analysis.
+    Standard/Deep mode only. Quick mode defaults to neutral.
     """
-    ticker = research.ticker
-    all_warnings: list[str] = list(research.warnings)
+    name = "SentimentAgent"
 
-    # Quick mode → skip
-    if depth == ReportDepth.QUICK:
-        log_agent("SentimentAgent", "Quick 모드 — 건너뜀 (기본 중립)")
-        return SentimentAgentOutput(
-            ticker=ticker,
-            sentiment_score=0.0,
-            sentiment_label="neutral",
-            pros=[],
-            cons=[],
-            citations=[],
-            warnings=["Quick 모드: 센티멘트 분석 건너뜀"],
-            generated_at=datetime.now(),
-        )
+    def run(
+        self,
+        data: DataAgentOutput,
+        research: ResearchAgentOutput,
+        depth: ReportDepth = ReportDepth.STANDARD,
+    ) -> SentimentAgentOutput:
+        """
+        Run the SentimentAgent.
+        - Quick mode: SKIP → default neutral sentiment
+        - Standard/Deep mode: 1 Gemini call with retrieved chunks
+        """
+        ticker = research.ticker
+        all_warnings: list[str] = list(research.warnings)
 
-    # If news count < 3 → force neutral with warning
-    if research.news_count < 3:
-        log_agent("SentimentAgent", f"[yellow]뉴스 {research.news_count}건 < 3 → 중립 기본값[/yellow]")
-        warn_msg = f"뉴스 기사 {research.news_count}건으로 센티멘트 분석이 제한됩니다."
-        all_warnings.append(warn_msg)
-        return SentimentAgentOutput(
-            ticker=ticker,
-            sentiment_score=0.0,
-            sentiment_label="neutral",
-            pros=[],
-            cons=[warn_msg],
-            citations=[],
-            warnings=all_warnings,
-            generated_at=datetime.now(),
-        )
-
-    # Build context from retrieved chunks
-    chunks = research.retrieved_chunks
-    if not chunks:
-        log_agent("SentimentAgent", "[yellow]검색된 청크 없음 → 중립 기본값[/yellow]")
-        all_warnings.append("검색된 뉴스 청크가 없어 센티멘트 분석이 제한됩니다.")
-        return SentimentAgentOutput(
-            ticker=ticker,
-            sentiment_score=0.0,
-            sentiment_label="neutral",
-            pros=[],
-            cons=["검색된 뉴스 청크 없음"],
-            citations=[],
-            warnings=all_warnings,
-            generated_at=datetime.now(),
-        )
-
-    chunks_text = "\n\n---\n\n".join(
-        f"[출처: {c.get('source', 'N/A')} | 시간: {c.get('timestamp', 'N/A')} | URL: {c.get('url', '')}]\n{c['content']}"
-        for c in chunks
-    )
-
-    user_prompt = (
-        f"종목: {ticker}\n"
-        f"수집된 뉴스 기사: {research.news_count}건\n"
-        f"리서치 핵심 테마: {', '.join(research.key_themes) if research.key_themes else 'N/A'}\n\n"
-        f"=== 관련 뉴스 기사 ===\n\n"
-        f"{chunks_text}\n\n"
-        f"위 뉴스 기사들의 감성을 분석하세요.\n"
-        f"Respond in Korean."
-    )
-
-    parsed: dict = {}
-
-    # Attempt #1
-    try:
-        log_agent("SentimentAgent", f"Gemini 호출 중 ({depth.value} 모드)...")
-        response = gemini_client.invoke("SentimentAgent", _SYSTEM_PROMPT, user_prompt, depth)
-        parsed = _safe_json_loads(response)
-    except Exception as e:
-        log_agent("SentimentAgent", f"[red]Gemini 호출 실패: {e}[/red]")
-        all_warnings.append(f"AI 센티멘트 분석 실패: {e}")
-
-    # If parsing failed, retry once
-    if not parsed or "sentiment_label" not in parsed:
-        log_agent("SentimentAgent", "[yellow]JSON 파싱 실패 → 재시도 중...[/yellow]")
-        try:
-            retry_prompt = (
-                f"{user_prompt}\n\n"
-                f"이전 응답의 JSON이 유효하지 않았습니다. "
-                f"반드시 위 구조의 순수 JSON만 반환하세요.\n"
-                f"Respond in Korean."
+        # Quick mode → skip
+        if depth == ReportDepth.QUICK:
+            log_agent(self.name, "Quick 모드 — 건너뜀 (기본 중립)")
+            return SentimentAgentOutput(
+                ticker=ticker,
+                sentiment_score=0.0,
+                sentiment_label="neutral",
+                pros=[],
+                cons=[],
+                citations=[],
+                warnings=["Quick 모드: 센티멘트 분석 건너뜀"],
+                generated_at=datetime.now(),
             )
-            response2 = gemini_client.invoke("SentimentAgent", _RETRY_SYSTEM_PROMPT, retry_prompt, depth)
-            parsed = _safe_json_loads(response2)
-        except Exception as e2:
-            log_agent("SentimentAgent", f"[red]재시도 실패: {e2}[/red]")
-            all_warnings.append(f"AI 재시도 실패: {e2}")
 
-    # If still failed, use safe defaults
-    if not parsed or "sentiment_label" not in parsed:
-        log_agent("SentimentAgent", "[red]안전 기본값 사용[/red]")
-        all_warnings.append("AI 분석 불가 — 중립 기본값 사용")
+        # If news count < 3 → force neutral with warning
+        if research.news_count < 3:
+            log_agent(self.name, f"[yellow]뉴스 {research.news_count}건 < 3 → 중립 기본값[/yellow]")
+            warn_msg = f"뉴스 기사 {research.news_count}건으로 센티멘트 분석이 제한됩니다."
+            all_warnings.append(warn_msg)
+            return SentimentAgentOutput(
+                ticker=ticker,
+                sentiment_score=0.0,
+                sentiment_label="neutral",
+                pros=[],
+                cons=[warn_msg],
+                citations=[],
+                warnings=all_warnings,
+                generated_at=datetime.now(),
+            )
+
+        # Build context from retrieved chunks
+        chunks = research.retrieved_chunks
+        if not chunks:
+            log_agent(self.name, "[yellow]검색된 청크 없음 → 중립 기본값[/yellow]")
+            all_warnings.append("검색된 뉴스 청크가 없어 센티멘트 분석이 제한됩니다.")
+            return SentimentAgentOutput(
+                ticker=ticker,
+                sentiment_score=0.0,
+                sentiment_label="neutral",
+                pros=[],
+                cons=["검색된 뉴스 청크 없음"],
+                citations=[],
+                warnings=all_warnings,
+                generated_at=datetime.now(),
+            )
+
+        chunks_text = "\n\n---\n\n".join(
+            f"[출처: {c.get('source', 'N/A')} | 시간: {c.get('timestamp', 'N/A')} | URL: {c.get('url', '')}]\n{c['content']}"
+            for c in chunks
+        )
+
+        user_prompt = (
+            f"종목: {ticker}\n"
+            f"수집된 뉴스 기사: {research.news_count}건\n"
+            f"리서치 핵심 테마: {', '.join(research.key_themes) if research.key_themes else 'N/A'}\n\n"
+            f"=== 관련 뉴스 기사 ===\n\n"
+            f"{chunks_text}\n\n"
+            f"위 뉴스 기사들의 감성을 분석하세요.\n"
+            f"Respond in Korean."
+        )
+
+        parsed: dict = {}
+
+        # Attempt #1
+        try:
+            log_agent(self.name, f"Gemini 호출 중 ({depth.value} 모드)...")
+            response = self.call_gemini(_SYSTEM_PROMPT, user_prompt, depth)
+            parsed = self.parse_json_response(response)
+        except Exception as e:
+            log_agent(self.name, f"[red]Gemini 호출 실패: {e}[/red]")
+            all_warnings.append(f"AI 센티멘트 분석 실패: {e}")
+
+        # If parsing failed, retry once
+        if not parsed or "sentiment_label" not in parsed:
+            log_agent(self.name, "[yellow]JSON 파싱 실패 → 재시도 중...[/yellow]")
+            try:
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"이전 응답의 JSON이 유효하지 않았습니다. "
+                    f"반드시 위 구조의 순수 JSON만 반환하세요.\n"
+                    f"Respond in Korean."
+                )
+                response2 = self.call_gemini(_RETRY_SYSTEM_PROMPT, retry_prompt, depth)
+                parsed = self.parse_json_response(response2)
+            except Exception as e2:
+                log_agent(self.name, f"[red]재시도 실패: {e2}[/red]")
+                all_warnings.append(f"AI 재시도 실패: {e2}")
+
+        # If still failed, use safe defaults
+        if not parsed or "sentiment_label" not in parsed:
+            log_agent(self.name, "[red]안전 기본값 사용[/red]")
+            all_warnings.append("AI 분석 불가 — 중립 기본값 사용")
+            return SentimentAgentOutput(
+                ticker=ticker,
+                sentiment_score=0.0,
+                sentiment_label="neutral",
+                pros=[],
+                cons=["AI 분석 불가"],
+                citations=[],
+                warnings=all_warnings,
+                generated_at=datetime.now(),
+            )
+
+        # Validate sentiment_label
+        label = parsed.get("sentiment_label", "neutral")
+        if label not in ("positive", "neutral", "negative"):
+            label = "neutral"
+
+        # Clamp sentiment_score
+        score = parsed.get("sentiment_score", 0.0)
+        try:
+            score = float(score)
+            score = max(-1.0, min(1.0, score))
+        except (TypeError, ValueError):
+            score = 0.0
+
+        # Build citations
+        citations_raw = parsed.get("citations", [])
+        citations: list[Citation] = []
+        for c in citations_raw:
+            if isinstance(c, dict):
+                citations.append(Citation(
+                    text=c.get("text", ""),
+                    source=c.get("source", ""),
+                    url=c.get("url", ""),
+                    timestamp=c.get("timestamp", ""),
+                ))
+
         return SentimentAgentOutput(
             ticker=ticker,
-            sentiment_score=0.0,
-            sentiment_label="neutral",
-            pros=[],
-            cons=["AI 분석 불가"],
-            citations=[],
+            sentiment_score=score,
+            sentiment_label=label,
+            pros=parsed.get("pros", []),
+            cons=parsed.get("cons", []),
+            citations=citations,
             warnings=all_warnings,
             generated_at=datetime.now(),
         )
 
-    # Validate sentiment_label
-    label = parsed.get("sentiment_label", "neutral")
-    if label not in ("positive", "neutral", "negative"):
-        label = "neutral"
 
-    # Clamp sentiment_score
-    score = parsed.get("sentiment_score", 0.0)
-    try:
-        score = float(score)
-        score = max(-1.0, min(1.0, score))
-    except (TypeError, ValueError):
-        score = 0.0
-
-    # Build citations
-    citations_raw = parsed.get("citations", [])
-    citations: list[Citation] = []
-    for c in citations_raw:
-        if isinstance(c, dict):
-            citations.append(Citation(
-                text=c.get("text", ""),
-                source=c.get("source", ""),
-                url=c.get("url", ""),
-                timestamp=c.get("timestamp", ""),
-            ))
-
-    return SentimentAgentOutput(
-        ticker=ticker,
-        sentiment_score=score,
-        sentiment_label=label,
-        pros=parsed.get("pros", []),
-        cons=parsed.get("cons", []),
-        citations=citations,
-        warnings=all_warnings,
-        generated_at=datetime.now(),
-    )
+def run_sentiment_agent(
+    data: DataAgentOutput,
+    research: ResearchAgentOutput,
+    depth: ReportDepth = ReportDepth.STANDARD,
+) -> SentimentAgentOutput:
+    """Helper for functional calls."""
+    return SentimentAgent().run(data, research, depth)

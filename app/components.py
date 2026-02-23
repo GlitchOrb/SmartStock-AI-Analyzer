@@ -1,7 +1,4 @@
-"""
-SmartStock AI Analyzer — Reusable UI Components
-Cards, gauges, charts, and metric displays for the Streamlit dashboard.
-"""
+"""Reusable Streamlit UI components."""
 
 from __future__ import annotations
 
@@ -14,7 +11,7 @@ from schemas.agents import (
     ReportAgentOutput,
     SentimentAgentOutput,
 )
-from utils.helpers import fmt_number, fmt_pct, signal_color, sentiment_color
+from utils.helpers import fmt_number, sentiment_color, signal_color
 
 
 def render_header(data: DataAgentOutput) -> None:
@@ -33,12 +30,7 @@ def render_header(data: DataAgentOutput) -> None:
         )
 
     with col2:
-        change_color = "#00C853" if data.price.change_pct >= 0 else "#D32F2F"
-        st.metric(
-            "Price",
-            f"${data.price.current:.2f}",
-            f"{data.price.change_pct:+.2f}%",
-        )
+        st.metric("Price", f"${data.price.current:.2f}", f"{data.price.change_pct:+.2f}%")
 
     with col3:
         st.metric("Market Cap", fmt_number(data.fundamentals.market_cap))
@@ -48,8 +40,10 @@ def render_header(data: DataAgentOutput) -> None:
 
 
 def render_signal_card(recommendation: RecommendationAgentOutput) -> None:
-    """Render the main signal card."""
-    color = signal_color(recommendation.signal.value)
+    """Render the main recommendation card."""
+    color = signal_color(recommendation.rating)
+    confidence_pct = _confidence_to_percent(recommendation.confidence)
+
     st.markdown(
         f"""
         <div style="
@@ -64,89 +58,111 @@ def render_signal_card(recommendation: RecommendationAgentOutput) -> None:
                 AI Recommendation
             </div>
             <div style="font-size: 2.2rem; font-weight: 700; color: {color};">
-                {recommendation.signal.value}
+                {recommendation.rating}
             </div>
             <div style="font-size: 0.95rem; color: #aaa; margin-top: 0.3rem;">
-                Confidence: {recommendation.confidence:.0%}
-                {f' · Target: ${recommendation.target_price:.2f}' if recommendation.target_price else ''}
-            </div>
-            <div style="font-size: 0.85rem; color: #999; margin-top: 0.5rem;">
-                {recommendation.time_horizon}
+                Confidence: {confidence_pct:.0f}%
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    if recommendation.rationale:
+        st.caption(" / ".join(recommendation.rationale[:3]))
+
 
 def render_analysis_section(analysis: AnalysisAgentOutput) -> None:
-    """Render technical and fundamental analysis."""
-    col1, col2 = st.columns(2)
+    """Render scenario-based analysis."""
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown("#### 📊 Technical Indicators")
-        for ind in analysis.technical_indicators:
-            color = signal_color(ind.signal.value)
-            st.markdown(
-                f"<div style='display:flex; justify-content:space-between; "
-                f"padding:4px 0; border-bottom:1px solid #333;'>"
-                f"<span>{ind.name}</span>"
-                f"<span style='color:{color}; font-weight:600;'>{ind.signal.value}</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown("#### Bull")
+        st.write(analysis.bull_case.thesis or "N/A")
+        if analysis.bull_case.catalysts:
+            st.markdown("**Catalysts**")
+            for item in analysis.bull_case.catalysts[:5]:
+                st.markdown(f"- {item}")
+        if analysis.bull_case.risks:
+            st.markdown("**Risks**")
+            for item in analysis.bull_case.risks[:5]:
+                st.markdown(f"- {item}")
 
     with col2:
-        st.markdown("#### 📋 Fundamental Verdicts")
-        for v in analysis.fundamental_verdicts:
-            assessment_color = {
-                "Undervalued": "#00C853",
-                "Fairly Valued": "#FFC107",
-                "Overvalued": "#D32F2F",
-            }.get(v.assessment, "#888")
-            st.markdown(
-                f"<div style='display:flex; justify-content:space-between; "
-                f"padding:4px 0; border-bottom:1px solid #333;'>"
-                f"<span>{v.metric}</span>"
-                f"<span style='color:{assessment_color}; font-weight:600;'>{v.assessment}</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown("#### Base")
+        st.write(analysis.base_case.thesis or "N/A")
+        if analysis.base_case.drivers:
+            st.markdown("**Drivers**")
+            for item in analysis.base_case.drivers[:6]:
+                st.markdown(f"- {item}")
 
-    st.markdown(f"**Combined Signal:** {analysis.combined_signal.value}")
-    if analysis.summary:
-        st.info(analysis.summary)
+    with col3:
+        st.markdown("#### Bear")
+        st.write(analysis.bear_case.thesis or "N/A")
+        if analysis.bear_case.risks:
+            st.markdown("**Risks**")
+            for item in analysis.bear_case.risks[:5]:
+                st.markdown(f"- {item}")
+        if analysis.bear_case.warning:
+            st.warning(analysis.bear_case.warning)
+
+    st.markdown("#### Key Drivers")
+    if analysis.key_drivers:
+        for item in analysis.key_drivers:
+            st.markdown(f"- {item}")
+    else:
+        st.info("No key drivers generated.")
 
 
 def render_sentiment_section(sentiment: SentimentAgentOutput) -> None:
     """Render sentiment analysis results."""
-    color = sentiment_color(sentiment.overall_sentiment.value)
+    normalized_label = sentiment.sentiment_label.capitalize()
+    color = sentiment_color(normalized_label)
+
     st.markdown(
         f"""
         <div style="display:flex; align-items:center; gap:1rem; margin:0.5rem 0;">
             <span style="font-size:1.5rem; color:{color}; font-weight:700;">
-                {sentiment.overall_sentiment.value}
+                {normalized_label}
             </span>
             <span style="color:#888;">
-                Score: {sentiment.score:+.2f} · Confidence: {sentiment.confidence:.0%}
+                Score: {sentiment.sentiment_score:+.2f}
             </span>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if sentiment.summary:
-        st.write(sentiment.summary)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Pros**")
+        if sentiment.pros:
+            for item in sentiment.pros[:8]:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("N/A")
 
-    if sentiment.news_items:
-        st.markdown("**Recent News:**")
-        for item in sentiment.news_items[:5]:
-            icon = {"Very Positive": "🟢", "Positive": "🟢", "Neutral": "⚪", "Negative": "🔴", "Very Negative": "🔴"}
-            st.markdown(f"{icon.get(item.sentiment.value, '⚪')} {item.headline}")
+    with col2:
+        st.markdown("**Cons**")
+        if sentiment.cons:
+            for item in sentiment.cons[:8]:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("N/A")
+
+    if sentiment.citations:
+        st.markdown("**Citations**")
+        for c in sentiment.citations[:5]:
+            source = c.source or "Unknown source"
+            stamp = f" ({c.timestamp})" if c.timestamp else ""
+            if c.url:
+                st.markdown(f"- [{source}{stamp}]({c.url})")
+            else:
+                st.markdown(f"- {source}{stamp}")
 
 
 def render_report_meta(report: ReportAgentOutput) -> None:
-    """Render report metadata and download button."""
+    """Render report metadata and download controls."""
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Gemini Calls", report.gemini_calls_used)
@@ -155,15 +171,34 @@ def render_report_meta(report: ReportAgentOutput) -> None:
     with col3:
         st.metric("Generation Time", f"{report.generation_time_s:.1f}s")
 
-    if report.pdf_path:
-        try:
-            with open(report.pdf_path, "rb") as f:
-                st.download_button(
-                    "📥 Download PDF Report",
-                    data=f.read(),
-                    file_name=f"{report.ticker}_{report.report_depth.value}_report.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-        except FileNotFoundError:
-            st.warning("PDF file not found.")
+    if report.pdf_bytes:
+        st.download_button(
+            "Download PDF Report",
+            data=report.pdf_bytes,
+            file_name=f"{report.ticker}_{report.report_depth.value}_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    else:
+        st.info("PDF is not available for this run.")
+
+    if report.markdown_report:
+        st.download_button(
+            "Download Markdown Report",
+            data=report.markdown_report.encode("utf-8"),
+            file_name=f"{report.ticker}_{report.report_depth.value}_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+
+def _confidence_to_percent(value: float | int | None) -> float:
+    if value is None:
+        return 0.0
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if conf <= 1.0:
+        conf *= 100.0
+    return max(0.0, min(100.0, conf))
